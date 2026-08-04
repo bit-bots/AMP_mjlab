@@ -1,22 +1,30 @@
 """HighTorque Pi Plus constants (AMP port).
 
 The robot model is kept byte-identical to the smp/BeyondMimic Pi Plus port
-(``piplus.xml`` + meshes copied verbatim). Only the mjlab wiring is adapted to the
-AMP repo's mjlab 1.2.0 API: because 1.2.0 lacks ``XmlActuatorCfg``, the actuators
-are re-declared with ``BuiltinPositionActuatorCfg`` using the exact gains from the
-XML defaults (arm: kp=30 kv=0.6 force=10 armature=0.01317; leg: kp=50 kv=1.1
-force=20 armature=0.044277; frictionloss=0.2).
+(``piplus.xml`` + meshes copied verbatim). For real-robot deployment the actuators
+mirror the bitbots ``mjlab_piplus`` model: ``XmlPositionActuatorCfg`` reads the XML's
+``<position>`` gains (kp=30/50, kv=0.6/1.1, forcerange), wrapped in
+``DelayedActuatorCfg`` for a randomized 0-3 control-step (0-60 ms @ 50 Hz) actuator
+latency. (mjlab 1.2.0 splits into Xml + Delayed cfgs what mjlab_piplus's 1.3.0
+``XmlActuatorCfg`` combines.)
 """
 
 from pathlib import Path
 
 import mujoco
 
-from mjlab.actuator import BuiltinPositionActuatorCfg
+from mjlab.actuator import BuiltinPositionActuatorCfg, DelayedActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.os import update_assets
 from mjlab.utils.spec_config import CollisionCfg
 from src import SRC_PATH
+
+# Actuator delay range in PHYSICS timesteps (mjlab DelayBuffer quantizes to physics
+# steps, not control steps), matching the bitbots mjlab_playground pi_plus.
+# At 5 ms physics (decimation 4 -> 50 Hz control): 12 physics steps = 60 ms = 3
+# control steps.
+ACTUATOR_LAG_MIN = 0
+ACTUATOR_LAG_MAX = 12
 
 ##
 # MJCF and assets.
@@ -37,46 +45,72 @@ def get_spec() -> mujoco.MjSpec:
   # Normalize meshdir so embedded-asset keys match MuJoCo's lookup ("meshes/<f>").
   spec.meshdir = "meshes"
   spec.assets = get_assets("meshes")
-  # Drop the XML's built-in <position> actuators: mjlab re-adds them from
-  # BuiltinPositionActuatorCfg, so keeping the XML ones doubles actuation (nu=40).
-  # The XML set would sit at ctrl=0 fighting the policy-driven set -> wrong pose.
+  # Drop the XML's built-in <position> actuators; the BuiltinPositionActuatorCfg
+  # (wrapped in DelayedActuatorCfg) re-adds them, so keeping the XML ones would
+  # double actuation (nu=40) with the XML set idle at ctrl=0 fighting the policy.
   for act in list(spec.actuators):
     spec.delete(act)
   return spec
 
 
 ##
-# Actuators (exact gains from piplus.xml <default> classes).
+# Actuators: deployment-faithful gains from the bitbots mjlab_playground pi_plus
+# (arm kp=6 kv=0.6 effort=10; leg kp=35 kv=1.1; hip_roll kp=35 kv=1.4; effort=20;
+# armature from bitbots_main), built-in position servos wrapped in
+# DelayedActuatorCfg for a randomized 0-12 physics-step latency (= 0-60 ms / 0-3
+# control steps @ 50 Hz; mjlab 1.2.0's BuiltinPositionActuatorCfg has no delay
+# field, so the delay is a wrapper).
 ##
 
-PIPLUS_ACTUATOR_ARM = BuiltinPositionActuatorCfg(
-  target_names_expr=(
-    ".*_shoulder_pitch_joint",
-    ".*_shoulder_roll_joint",
-    ".*_upper_arm_joint",
-    ".*_elbow_joint",
+PIPLUS_ACTUATOR_ARM = DelayedActuatorCfg(
+  base_cfg=BuiltinPositionActuatorCfg(
+    target_names_expr=(
+      ".*_shoulder_pitch_joint",
+      ".*_shoulder_roll_joint",
+      ".*_upper_arm_joint",
+      ".*_elbow_joint",
+    ),
+    stiffness=6.0,
+    damping=0.6,
+    effort_limit=10.0,
+    armature=0.01317,
+    frictionloss=0.2,
   ),
-  stiffness=30.0,
-  damping=0.6,
-  effort_limit=10.0,
-  armature=0.01317,
-  frictionloss=0.2,
+  delay_min_lag=ACTUATOR_LAG_MIN,
+  delay_max_lag=ACTUATOR_LAG_MAX,
 )
 
-PIPLUS_ACTUATOR_LEG = BuiltinPositionActuatorCfg(
-  target_names_expr=(
-    ".*_hip_pitch_joint",
-    ".*_hip_roll_joint",
-    ".*_thigh_joint",
-    ".*_calf_joint",
-    ".*_ankle_pitch_joint",
-    ".*_ankle_roll_joint",
+# Hip-roll gets stiffer derivative gain (kv=1.4) for lateral stability.
+PIPLUS_ACTUATOR_HIP_ROLL = DelayedActuatorCfg(
+  base_cfg=BuiltinPositionActuatorCfg(
+    target_names_expr=(".*_hip_roll_joint",),
+    stiffness=35.0,
+    damping=1.4,
+    effort_limit=20.0,
+    armature=0.01316,
+    frictionloss=0.2,
   ),
-  stiffness=50.0,
-  damping=1.1,
-  effort_limit=20.0,
-  armature=0.044277,
-  frictionloss=0.2,
+  delay_min_lag=ACTUATOR_LAG_MIN,
+  delay_max_lag=ACTUATOR_LAG_MAX,
+)
+
+PIPLUS_ACTUATOR_LEG = DelayedActuatorCfg(
+  base_cfg=BuiltinPositionActuatorCfg(
+    target_names_expr=(
+      ".*_hip_pitch_joint",
+      ".*_thigh_joint",
+      ".*_calf_joint",
+      ".*_ankle_pitch_joint",
+      ".*_ankle_roll_joint",
+    ),
+    stiffness=35.0,
+    damping=1.1,
+    effort_limit=20.0,
+    armature=0.01316,
+    frictionloss=0.2,
+  ),
+  delay_min_lag=ACTUATOR_LAG_MIN,
+  delay_max_lag=ACTUATOR_LAG_MAX,
 )
 
 ##
@@ -124,7 +158,7 @@ FULL_COLLISION = CollisionCfg(
 )
 
 PIPLUS_ARTICULATION = EntityArticulationInfoCfg(
-  actuators=(PIPLUS_ACTUATOR_ARM, PIPLUS_ACTUATOR_LEG),
+  actuators=(PIPLUS_ACTUATOR_ARM, PIPLUS_ACTUATOR_HIP_ROLL, PIPLUS_ACTUATOR_LEG),
   soft_joint_pos_limit_factor=0.9,
 )
 
