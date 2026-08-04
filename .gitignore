@@ -42,3 +42,7 @@ src/tasks/uni_track
 
 
 
+
+# local install/run artifacts
+overrides.txt
+wandb/

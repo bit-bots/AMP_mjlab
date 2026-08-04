@@ -11,3 +11,10 @@ from .unitree_g1.g1_23dof_constants import (
 from .unitree_g1.g1_23dof_constants import (
   get_g1_23dof_robot_cfg as get_g1_23dof_robot_cfg,
 )
+
+from .piplus import (
+  PIPLUS_ACTION_SCALE as PIPLUS_ACTION_SCALE,
+)
+from .piplus import (
+  get_piplus_robot_cfg as get_piplus_robot_cfg,
+)
