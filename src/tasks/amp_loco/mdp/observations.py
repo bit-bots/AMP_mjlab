@@ -19,6 +19,34 @@ if TYPE_CHECKING:
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
+
+def _apply_imu_bias(env: "ManagerBasedRlEnv", vec: torch.Tensor) -> torch.Tensor:
+  """Left-multiply a (num_envs, 3) body-frame vector by the per-env IMU mounting
+  rotation set by ``randomize_imu_mounting_bias`` (identity if unset)."""
+  R = getattr(env, "imu_bias_rot", None)
+  if R is None:
+    return vec
+  return torch.bmm(R, vec.unsqueeze(-1)).squeeze(-1)
+
+
+def imu_gyro_biased(env: "ManagerBasedRlEnv", sensor_name: str) -> torch.Tensor:
+  """Gyro (base angular velocity) sensor reading with the IMU mounting bias applied.
+
+  Actor-only variant of ``builtin_sensor``; the clean critic keeps the unbiased
+  reading. Additive gyro noise is applied on top by the observation manager.
+  """
+  sensor = env.scene[sensor_name]
+  return _apply_imu_bias(env, sensor.data)
+
+
+def imu_projected_gravity_biased(
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+  """Projected-gravity obs with the IMU mounting bias applied (actor-only)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return _apply_imu_bias(env, asset.data.projected_gravity_b)
+
+
 def robot_body_pos_b(
     env: ManagerBasedRlEnv,
     anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),

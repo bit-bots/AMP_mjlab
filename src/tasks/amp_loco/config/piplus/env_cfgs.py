@@ -1,17 +1,22 @@
 """HighTorque Pi Plus AMP locomotion environment configs (mirrors the G1 config)."""
 
+import copy
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
+from mjlab.envs.mdp import events as event_fns
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+from mjlab.utils.noise import GaussianNoiseCfg, UniformNoiseCfg as Unoise
 
 from src.assets.robots import PIPLUS_ACTION_SCALE, get_piplus_robot_cfg
+from src.tasks.amp_loco import mdp as amp_mdp
 from src.tasks.amp_loco.amp_env_cfg import make_amp_env_cfg
 
 # --- Pi Plus name mapping ---------------------------------------------------
@@ -98,6 +103,29 @@ def piplus_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = FOOT_GEOMS
   cfg.events["base_com"].params["asset_cfg"].body_names = (ANCHOR_NAME,)
 
+  # mjlab_piplus-style random impulse on the base, on top of AMP's friction/COM/
+  # encoder DR (AMP has no impulse term). Matches the deployment repo: +/-80 N for
+  # 0.1-0.2 s, 1-5 s cooldown, applied to base_link.
+  cfg.events["impulse"] = EventTermCfg(
+    func=event_fns.apply_body_impulse,
+    mode="step",
+    params={
+      "force_range": (-80.0, 80.0),
+      "torque_range": (0.0, 0.0),
+      "duration_s": (0.1, 0.2),
+      "cooldown_s": (1.0, 5.0),
+      "asset_cfg": SceneEntityCfg("robot", body_names=(ROOT_NAME,)),
+    },
+  )
+
+  # Joint (encoder calibration) bias: mjxperiment resamples a per-EPISODE Gaussian
+  # bias of std 2deg (0.0349 rad) added to the motor reference. AMP defaults to a
+  # STARTUP-only uniform +/-0.015 (std ~0.009), ~4x smaller and fixed for all of
+  # training. encoder_bias only supports uniform sampling, so match the std with a
+  # +/-0.06 range (uniform half-width 0.0349*sqrt(3)) and resample per reset.
+  cfg.events["encoder_bias"].mode = "reset"
+  cfg.events["encoder_bias"].params["bias_range"] = (-0.06, 0.06)
+
   # No recovery clips yet: disable delayed-reset recovery for the first walk run.
   cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 0.0
   cfg.events["init_motion_loader"].params["max_delay_steps"] = 0
@@ -139,6 +167,35 @@ def piplus_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       p = getattr(term, "params", None)
       if p and p.get("sensor_name") in _sensor_remap:
         p["sensor_name"] = _sensor_remap[p["sensor_name"]]
+
+  # Match the deployed mjxperiment walk's IMU noise: same distribution (Gaussian)
+  # and magnitude. mjxperiment uses gyro ~ N(0, 0.05 rad/s) and projected-gravity
+  # ~ N(0, 0.03). AMP defaults are uniform +/-0.2 (gyro) and +/-0.05 (gravity),
+  # both noisier and the wrong shape.
+  cfg.observations["actor"].terms["base_ang_vel"].noise = GaussianNoiseCfg(mean=0.0, std=0.05)
+  cfg.observations["actor"].terms["projected_gravity"].noise = GaussianNoiseCfg(mean=0.0, std=0.03)
+  # joint_pos: mjxperiment uses uniform +/-0.05 rad (same distribution as AMP's, but
+  # AMP defaulted to a quieter +/-0.01). Bump to match.
+  cfg.observations["actor"].terms["joint_pos"].noise = Unoise(n_min=-0.05, n_max=0.05)
+
+  # IMU mounting bias (mjxperiment): a per-episode roll/pitch misalignment (Gaussian
+  # std 0.01 rad) rotates the gyro + projected-gravity readings. Applied to the ACTOR
+  # only -- the critic keeps enable_corruption=False and the true (unbiased) readings,
+  # so we de-share those two actor terms (critic_terms = {**actor_terms} makes them
+  # the same objects) before swapping their obs functions to the biased variants.
+  _biased = {
+    "base_ang_vel": amp_mdp.imu_gyro_biased,
+    "projected_gravity": amp_mdp.imu_projected_gravity_biased,
+  }
+  for _name, _fn in _biased.items():
+    _term = copy.copy(cfg.observations["actor"].terms[_name])
+    _term.func = _fn
+    cfg.observations["actor"].terms[_name] = _term
+  cfg.events["imu_mounting_bias"] = EventTermCfg(
+    func=amp_mdp.randomize_imu_mounting_bias,
+    mode="reset",
+    params={"std_rad": 0.01},
+  )
 
   if play:
     cfg.episode_length_s = int(1e9)

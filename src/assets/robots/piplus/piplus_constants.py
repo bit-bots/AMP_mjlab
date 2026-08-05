@@ -54,8 +54,9 @@ def get_spec() -> mujoco.MjSpec:
 
 
 ##
-# Actuators: deployment-faithful gains from the bitbots mjlab_playground pi_plus
-# (arm kp=6 kv=0.6 effort=10; leg kp=35 kv=1.1; hip_roll kp=35 kv=1.4; effort=20;
+# Actuators: gains based on the bitbots mjlab_playground pi_plus, leg/hip_roll kp
+# bumped 35->50 for stiffer tracking
+# (arm kp=6 kv=0.6 effort=10; leg kp=50 kv=1.1; hip_roll kp=50 kv=1.4; effort=20;
 # armature from bitbots_main), built-in position servos wrapped in
 # DelayedActuatorCfg for a randomized 0-12 physics-step latency (= 0-60 ms / 0-3
 # control steps @ 50 Hz; mjlab 1.2.0's BuiltinPositionActuatorCfg has no delay
@@ -84,7 +85,7 @@ PIPLUS_ACTUATOR_ARM = DelayedActuatorCfg(
 PIPLUS_ACTUATOR_HIP_ROLL = DelayedActuatorCfg(
   base_cfg=BuiltinPositionActuatorCfg(
     target_names_expr=(".*_hip_roll_joint",),
-    stiffness=35.0,
+    stiffness=50.0,
     damping=1.4,
     effort_limit=20.0,
     armature=0.01316,
@@ -103,7 +104,7 @@ PIPLUS_ACTUATOR_LEG = DelayedActuatorCfg(
       ".*_ankle_pitch_joint",
       ".*_ankle_roll_joint",
     ),
-    stiffness=35.0,
+    stiffness=50.0,
     damping=1.1,
     effort_limit=20.0,
     armature=0.01316,

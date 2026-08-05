@@ -235,3 +235,36 @@ def reset_from_motion_data(
         motion_dir=motion_dir,
         asset_cfg=asset_cfg,
     )
+
+
+def randomize_imu_mounting_bias(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    std_rad: float = 0.01,
+) -> None:
+    """Per-episode IMU mounting misalignment (roll/pitch).
+
+    Mirrors the mjxperiment deployment model: sample roll,pitch ~ N(0, std_rad),
+    build ``R = Ry(pitch) @ Rx(roll)`` and stash it on the env as ``imu_bias_rot``.
+    The biased gyro / projected-gravity actor obs functions left-multiply their
+    (body-frame) vector by this rotation, so the policy sees the IMU as if it were
+    mounted with a small fixed tilt for the whole episode.
+    """
+    if not hasattr(env, "imu_bias_rot"):
+        env.imu_bias_rot = (
+            torch.eye(3, device=env.device).unsqueeze(0).repeat(env.num_envs, 1, 1)
+        )
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+
+    n = env_ids.shape[0]
+    rp = torch.randn(n, 2, device=env.device) * std_rad
+    roll, pitch = rp[:, 0], rp[:, 1]
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    z, o = torch.zeros_like(cr), torch.ones_like(cr)
+    # fmt: off
+    Rx = torch.stack([o, z, z,  z, cr, -sr,  z, sr, cr], dim=-1).reshape(n, 3, 3)
+    Ry = torch.stack([cp, z, sp,  z, o, z,  -sp, z, cp], dim=-1).reshape(n, 3, 3)
+    # fmt: on
+    env.imu_bias_rot[env_ids] = torch.bmm(Ry, Rx)
