@@ -17,7 +17,7 @@ from mjlab.utils.lab_api.math import (
 from rsl_rl.utils import AMPLoader
 from src.tasks.amp_loco.config.piplus.env_cfgs import AMP_BODY_NAMES, ANCHOR_NAME
 
-NPZ = "src/assets/motions/piplus/amp/WalkandRun/piplus_walk.npz"
+NPZ = "src/assets/motions/piplus/amp/WalkandRun/piplus_run1_subject2.npz"
 DEV = "cuda:0"
 
 env_cfg = load_env_cfg("PiPlus-AMP-Flat")
