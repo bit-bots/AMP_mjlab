@@ -11,6 +11,16 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 
+def object_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+  """Terminate an env the instant the named contact sensor registers a contact.
+
+  Used for the kick task's left-foot/ball sensor: only the right foot may kick.
+  """
+  sensor: ContactSensor = env.scene[sensor_name]
+  assert sensor.data.found is not None
+  return (sensor.data.found > 0).any(dim=-1)
+
+
 class DelayedTerminationManager(TerminationManager):
     """TerminationManager subclass that delays reset for a subset of envs.
 

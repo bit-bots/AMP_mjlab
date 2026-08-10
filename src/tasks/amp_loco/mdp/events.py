@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import sample_uniform
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
 
+from src.assets.objects import BALL_RADIUS
 from src.tasks.amp_loco.ampmotion_loader import MotionLoader
+from src.tasks.amp_loco.mdp.rewards import foot_medial_alignment
 from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
@@ -268,3 +272,144 @@ def randomize_imu_mounting_bias(
     Ry = torch.stack([cp, z, sp,  z, o, z,  -sp, z, cp], dim=-1).reshape(n, 3, 3)
     # fmt: on
     env.imu_bias_rot[env_ids] = torch.bmm(Ry, Rx)
+
+
+# ------------------------------------------------------------------
+# Kick task: ball spawn / respawn
+#
+# Spawn geometry (distance + heading cone around the robot) mirrors
+# mjxperiment's kick.py ``_sample_ball_offset``; placement is otherwise
+# convention-free (world-frame xy + fixed z=radius, identity orientation).
+# ------------------------------------------------------------------
+
+
+def _place_ball_near_robot(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    robot: Entity,
+    ball: Entity,
+    dist_range: tuple[float, float],
+    cone_deg: float,
+) -> None:
+    n = env_ids.shape[0]
+    robot_xy = robot.data.root_link_pos_w[env_ids, :2]
+    robot_yaw = robot.data.heading_w[env_ids]
+
+    dist = sample_uniform(dist_range[0], dist_range[1], (n,), device=env.device)
+    cone = math.radians(cone_deg)
+    angle = robot_yaw + sample_uniform(-cone, cone, (n,), device=env.device)
+    offset = torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1) * dist.unsqueeze(-1)
+
+    pose = torch.zeros((n, 7), device=env.device)
+    pose[:, 0:2] = robot_xy + offset
+    pose[:, 2] = BALL_RADIUS
+    pose[:, 3] = 1.0  # identity quat (w,x,y,z)
+    ball.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+    ball.write_root_link_velocity_to_sim(torch.zeros((n, 6), device=env.device), env_ids=env_ids)
+
+    # Every ball reposition (episode reset or post-kick respawn) starts a fresh
+    # "life" for one-shot rewards keyed off the ball, e.g.
+    # first_object_contact_reward's contact_reward_claimed (mdp/rewards.py).
+    if hasattr(env, "contact_reward_claimed"):
+        env.contact_reward_claimed[env_ids] = False
+
+
+def reset_ball_near_robot(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    robot_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    dist_range: tuple[float, float] = (0.4, 1.2),
+    cone_deg: float = 90.0,
+) -> None:
+    """Reset event: spawn the ball at a random distance/heading around the robot.
+
+    Must run AFTER any reset event that repositions the robot (e.g.
+    ``reset_from_motion_data``) -- ``EntityData`` documents that write_* calls
+    only land in ``qpos``/``qvel``, and read properties like
+    ``root_link_pos_w``/``heading_w`` (``xpos``/``xquat``-derived) need a
+    ``sim.forward()`` in between to pick them up. ``ManagerBasedRlEnv.reset()``
+    defers that forward() until *all* reset events have run, so this event
+    forces one early to read the robot's just-written, final reset pose.
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    env.scene.write_data_to_sim()
+    env.sim.forward()
+    robot: Entity = env.scene[robot_cfg.name]
+    ball: Entity = env.scene[ball_cfg.name]
+    _place_ball_near_robot(env, env_ids, robot, ball, dist_range, cone_deg)
+    if hasattr(env, "kick_timer"):
+        env.kick_timer[env_ids] = 0
+    if hasattr(env, "kick_style"):
+        env.kick_style[env_ids] = 0.0
+
+
+class kick_contact_cycle:
+    """Contact-driven ball cycle: open a reward-farming window on right-foot/ball
+    contact, hold it for ``window_s`` seconds, then reset the ball (new random
+    position near the robot + zero velocity) WITHOUT ending the episode.
+
+    No more distance-based "ball rolled too far" respawn/penalty -- the ball only
+    ever moves once the robot actually kicks it, making the whole ball-reset
+    lifecycle purely contact-driven. ``env.kick_timer`` (steps remaining in the
+    window) and ``env.kick_style`` (the foot/ball alignment quality at the moment
+    of contact, in [0, 1], frozen for the whole window) are shared with
+    ``kick_impact_reward`` (mdp/rewards.py), which reads them to gate/scale the
+    ball speed+height reward; this event owns writing both. Use with
+    ``mode="step"``.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
+        self._robot: Entity = env.scene[cfg.params["robot_cfg"].name]
+        self._ball: Entity = env.scene[cfg.params["ball_cfg"].name]
+        self._foot_body_id = self._robot.find_bodies(cfg.params["foot_body_name"])[0][0]
+        self._medial_sign = cfg.params.get("medial_sign", 1.0)
+        window_s = cfg.params.get("window_s", 2.0)
+        self._window_steps = max(1, round(window_s / env.step_dt))
+        env.kick_timer = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        env.kick_style = torch.zeros(env.num_envs, device=env.device)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | None,
+        robot_cfg: SceneEntityCfg,
+        ball_cfg: SceneEntityCfg,
+        contact_sensor_name: str,
+        foot_body_name: str,
+        medial_sign: float = 1.0,
+        window_s: float = 2.0,
+        dist_range: tuple[float, float] = (0.4, 1.2),
+        cone_deg: float = 90.0,
+    ) -> None:
+        del env_ids, robot_cfg, ball_cfg, foot_body_name, medial_sign, window_s
+        # Unused; resolved once in __init__.
+        sensor = env.scene[contact_sensor_name]
+        assert sensor.data.found is not None
+        touching = (sensor.data.found > 0).any(dim=-1)
+
+        idle = env.kick_timer == 0
+        new_contact = touching & idle
+        env.kick_timer = torch.where(
+            new_contact, torch.full_like(env.kick_timer, self._window_steps), env.kick_timer
+        )
+
+        if new_contact.any():
+            foot_pos = self._robot.data.body_link_pos_w[:, self._foot_body_id, :2]
+            foot_quat = self._robot.data.body_link_quat_w[:, self._foot_body_id]
+            ball_pos = self._ball.data.root_link_pos_w[:, :2]
+            align = foot_medial_alignment(foot_pos, foot_quat, ball_pos, self._medial_sign)
+            # Squared clip-to-[0,1], mirroring mjxperiment's kick_style: only
+            # alignment close to perfectly medial earns close to full credit, so
+            # a proper side-foot kick pays much more than a glancing one.
+            style = torch.clamp(align, 0.0, 1.0) ** 2
+            env.kick_style = torch.where(new_contact, style, env.kick_style)
+
+        expiring = env.kick_timer == 1  # last active step of the window
+        env.kick_timer = torch.clamp(env.kick_timer - 1, min=0)
+
+        if not expiring.any():
+            return
+        ids = expiring.nonzero(as_tuple=False).squeeze(-1)
+        _place_ball_near_robot(env, ids, self._robot, self._ball, dist_range, cone_deg)

@@ -111,6 +111,38 @@ def robot_body_lin_vel_b(
 
     return body_lin_vel_b.reshape(env.num_envs, -1)
 
+def object_pos_b(
+    env: ManagerBasedRlEnv,
+    object_cfg: SceneEntityCfg,
+    anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+) -> torch.Tensor:
+    """Free-body object's root position relative to the anchor body (e.g. ball in
+    torso frame), used in place of a velocity command for goal-directed tasks."""
+    anchor: Entity = env.scene[anchor_cfg.name]
+    obj: Entity = env.scene[object_cfg.name]
+
+    anchor_pos_w = anchor.data.body_link_pos_w[:, anchor_cfg.body_ids[0]]
+    anchor_quat_w = anchor.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
+
+    pos_b, _ = subtract_frame_transforms(
+        anchor_pos_w, anchor_quat_w, obj.data.root_link_pos_w, obj.data.root_link_quat_w,
+    )
+    return pos_b
+
+
+def object_lin_vel_b(
+    env: ManagerBasedRlEnv,
+    object_cfg: SceneEntityCfg,
+    anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+) -> torch.Tensor:
+    """Free-body object's linear velocity expressed in the anchor body's frame."""
+    anchor: Entity = env.scene[anchor_cfg.name]
+    obj: Entity = env.scene[object_cfg.name]
+
+    anchor_quat_w = anchor.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
+    return quat_apply_inverse(anchor_quat_w, obj.data.root_link_lin_vel_w)
+
+
 def robot_body_ang_vel_b(
     env: ManagerBasedRlEnv,
     anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
