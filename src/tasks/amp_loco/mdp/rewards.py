@@ -227,22 +227,42 @@ def soft_landing(
       cost = cost * active
   return cost
 
+def _offset_anchor_pos_w(
+  robot: Entity, anchor_cfg: SceneEntityCfg, offset_b: tuple[float, float, float]
+) -> torch.Tensor:
+  """Anchor body position, shifted by a local-frame offset (e.g. off-center
+  toward the kicking foot instead of the body origin)."""
+  pos_w = robot.data.body_link_pos_w[:, anchor_cfg.body_ids[0]]
+  if offset_b == (0.0, 0.0, 0.0):
+    return pos_w
+  quat_w = robot.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
+  offset = torch.tensor(offset_b, device=pos_w.device, dtype=pos_w.dtype)
+  return pos_w + quat_apply(quat_w, offset.expand(pos_w.shape[0], 3))
+
+
 def move_toward_object(
   env: ManagerBasedRlEnv,
   object_cfg: SceneEntityCfg,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
   max_speed: float = 0.5,
+  offset_b: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
   """Reward the anchor's xy velocity component toward a free-body object.
 
   Replaces command-velocity tracking for goal-directed tasks (e.g. walking to the
   ball): reward = clip(v . dir_to_object / max_speed, -0.5, 1.0). Mirrors
   mjxperiment's kick.py ``_reward_approach``.
+
+  ``offset_b``: local-frame offset from the anchor body's origin (e.g. toward
+  the kicking foot rather than the torso center) used for the position/direction
+  math; the anchor's own linear velocity is still used as-is (the rotational
+  contribution of a ~20cm offset to that velocity is negligible next to
+  translation for this reward's purpose).
   """
   robot: Entity = env.scene[anchor_cfg.name]
   obj: Entity = env.scene[object_cfg.name]
 
-  anchor_pos = robot.data.body_link_pos_w[:, anchor_cfg.body_ids[0], :2]
+  anchor_pos = _offset_anchor_pos_w(robot, anchor_cfg, offset_b)[:, :2]
   anchor_vel = robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2]
   to_obj = obj.data.root_link_pos_w[:, :2] - anchor_pos
   direction = to_obj / (torch.norm(to_obj, dim=-1, keepdim=True) + 1e-6)
@@ -254,17 +274,21 @@ def torso_orient_to_object(
   env: ManagerBasedRlEnv,
   object_cfg: SceneEntityCfg,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+  offset_b: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
   """Reward the anchor body's forward direction pointing at a free-body object.
 
   reward = exp(-|angle to object in the anchor's local frame|), 1.0 when the
   object is dead ahead, decaying smoothly as it swings to the side/behind.
   Mirrors mjxperiment kick.py's ``_reward_orient_to_ball``.
+
+  ``offset_b``: see ``move_toward_object`` -- shifts which point's-eye-view the
+  angle is computed from, without changing the anchor's own orientation axes.
   """
   robot: Entity = env.scene[anchor_cfg.name]
   obj: Entity = env.scene[object_cfg.name]
 
-  anchor_pos_w = robot.data.body_link_pos_w[:, anchor_cfg.body_ids[0]]
+  anchor_pos_w = _offset_anchor_pos_w(robot, anchor_cfg, offset_b)
   anchor_quat_w = robot.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
   pos_b, _ = subtract_frame_transforms(
     anchor_pos_w, anchor_quat_w, obj.data.root_link_pos_w, obj.data.root_link_quat_w

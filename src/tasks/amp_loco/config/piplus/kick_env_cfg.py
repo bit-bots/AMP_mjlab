@@ -21,6 +21,7 @@ and WHEN that motion fires:
   - the left foot touching the ball ends the episode.
 """
 
+import copy
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -30,6 +31,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.utils.noise import GaussianNoiseCfg
 
 from src.assets.objects import get_ball_cfg
 from src.tasks.amp_loco import mdp as amp_mdp
@@ -50,7 +52,15 @@ BALL_SPAWN_CONE_DEG = 90.0
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
-FOOT_ALIGNMENT_CLOSE_DIST = 0.5
+# Bumped from 0.5 so the foot starts turning to line up the medial edge earlier
+# in the approach, not just in the last half-meter.
+FOOT_ALIGNMENT_CLOSE_DIST = 0.9
+# move_to_ball/torso_orient_to_ball measure from a point 20cm to the robot's
+# right of the anchor (torso) instead of the anchor's own origin -- lines the
+# approach up around the kicking (right) foot's side rather than the body
+# center. -Y is the robot's right in the torso's local frame (matches
+# foot_medial_alignment's convention: r_ankle_roll_link sits on the -Y side).
+KICK_APPROACH_OFFSET_B = (0.0, -0.20, 0.0)
 
 
 def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -100,7 +110,15 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   for grp_name in ("actor", "critic"):
     grp = cfg.observations[grp_name]
     grp.terms.pop("command", None)
-    grp.terms.update(ball_obs_terms)
+    # Copy (not share) the term objects -- ball_obs_terms's dict values would
+    # otherwise be the SAME ObservationTermCfg instances in both groups, so
+    # adding actor-only noise below would leak into the critic's ground truth.
+    for name, term in ball_obs_terms.items():
+      grp.terms[name] = copy.copy(term)
+
+  # Actor-only ball position noise (critic keeps ground truth): models a noisy
+  # ball-tracking perception (e.g. vision) rather than perfect state.
+  cfg.observations["actor"].terms["ball_pos_b"].noise = GaussianNoiseCfg(mean=0.0, std=0.07)
 
   # --- Drop velocity-tracking rewards; add ball-approach + kick rewards ----
   for name in ("track_anchor_linear_velocity", "track_anchor_angular_velocity", "foot_slip"):
@@ -116,6 +134,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       "max_speed": 0.5,
+      "offset_b": KICK_APPROACH_OFFSET_B,
     },
   )
   # Small dense reward for facing the ball (mirrors mjxperiment's
@@ -127,6 +146,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
+      "offset_b": KICK_APPROACH_OFFSET_B,
     },
   )
   # Small penalty for foot sliding while grounded. mdp.feet_slip (mjlab base,
@@ -139,6 +159,14 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "sensor_name": "feet_ground_contact",
       "asset_cfg": SceneEntityCfg("robot", site_names=SITE_NAMES),
     },
+  )
+  # Tiny torque penalty (not present anywhere in the kick task's reward set
+  # before this): mdp.joint_torques_l2 is mjlab's built-in L2 actuator-force
+  # cost, small enough to just discourage needlessly forceful motion without
+  # fighting the kick_impact incentive.
+  cfg.rewards["joint_torques_l2"] = RewardTermCfg(
+    func=amp_mdp.joint_torques_l2,
+    weight=-1.0e-5,
   )
   # right_foot_ball_contact/kick_impact bumped ~40x (2.0->80.0, 1.0->40.0): even
   # with AMP back at its original weight, the policy still converged to standing
