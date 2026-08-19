@@ -244,20 +244,35 @@ def move_toward_object(
   env: ManagerBasedRlEnv,
   object_cfg: SceneEntityCfg,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
-  max_speed: float = 0.5,
   offset_b: tuple[float, float, float] = (0.0, 0.0, 0.0),
+  alignment_power: float = 1.0,
 ) -> torch.Tensor:
-  """Reward the anchor's xy velocity component toward a free-body object.
+  """World-frame, heading-independent reward for the anchor's speed toward a
+  free-body object.
 
-  Replaces command-velocity tracking for goal-directed tasks (e.g. walking to the
-  ball): reward = clip(v . dir_to_object / max_speed, -0.5, 1.0). Mirrors
-  mjxperiment's kick.py ``_reward_approach``.
+  reward = ``speed * sign(cos(angle)) * |cos(angle)| ** alignment_power``,
+  where ``angle`` is between the anchor's own linear velocity and the unit
+  direction from the (locally-offset) anchor position to the object.
+  ``alignment_power`` > 1 narrows the reward around the correct heading: a
+  bare cosine (power=1) gives most of its max credit even fairly off-angle
+  (e.g. cos(30deg)=0.87), while cubing it (power=3) drops that same
+  30deg-off motion to ~0.65 and 60deg-off to ~0.13, so only genuinely
+  well-aimed motion is rewarded much. Moving AWAY from the object
+  (angle > 90deg) is penalized, not just zero -- the sign is preserved
+  through the power regardless of whether ``alignment_power`` is odd or
+  even. No distance scaling (would vanish right at the object -- see git
+  history) and no upper cap on speed.
+
+  Deliberately uses the anchor body's own linear velocity, not the offset
+  point's true (``omega x r``-corrected) velocity: pure rotation in place
+  (zero body translation) then scores zero regardless of how far the local
+  offset sweeps through space, so pivoting/circling without actually
+  translating the body isn't rewarded (confirmed empirically: circling
+  scored a high reward when the offset-corrected velocity was used instead).
 
   ``offset_b``: local-frame offset from the anchor body's origin (e.g. toward
-  the kicking foot rather than the torso center) used for the position/direction
-  math; the anchor's own linear velocity is still used as-is (the rotational
-  contribution of a ~20cm offset to that velocity is negligible next to
-  translation for this reward's purpose).
+  the kicking foot rather than the torso center), used for the tracked
+  position only.
   """
   robot: Entity = env.scene[anchor_cfg.name]
   obj: Entity = env.scene[object_cfg.name]
@@ -266,8 +281,10 @@ def move_toward_object(
   anchor_vel = robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2]
   to_obj = obj.data.root_link_pos_w[:, :2] - anchor_pos
   direction = to_obj / (torch.norm(to_obj, dim=-1, keepdim=True) + 1e-6)
-  v_toward = torch.sum(anchor_vel * direction, dim=-1)
-  return torch.clamp(v_toward / max_speed, -0.5, 1.0)
+  speed = torch.norm(anchor_vel, dim=-1)
+  cos_align = torch.clamp(torch.sum(anchor_vel * direction, dim=-1) / (speed + 1e-6), -1.0, 1.0)
+  signed_align = torch.sign(cos_align) * torch.abs(cos_align) ** alignment_power
+  return speed * signed_align
 
 
 def torso_orient_to_object(
@@ -332,6 +349,7 @@ def first_object_contact_reward(
   env: ManagerBasedRlEnv,
   sensor_name: str,
   state_attr: str = "contact_reward_claimed",
+  ready_attr: str | None = None,
 ) -> torch.Tensor:
   """One-shot reward on the first step the sensor registers contact, not again
   until the tracked object (ball) is repositioned.
@@ -343,6 +361,11 @@ def first_object_contact_reward(
   (mdp/events.py) whenever the ball's position is reset -- either the episode
   reset or the post-kick ``kick_contact_cycle`` respawn -- so a fresh touch
   after the next reset earns the reward again.
+
+  ``ready_attr`` is an optional extra gate: if set to an attribute name that
+  exists on ``env`` and is truthy for a given env, contact only counts while
+  that flag is set. Unused by the kick task (no such gating attribute is
+  set there anymore); kept for other tasks that might want it.
   """
   claimed = getattr(env, state_attr, None)
   if claimed is None:
@@ -350,9 +373,78 @@ def first_object_contact_reward(
   sensor: ContactSensor = env.scene[sensor_name]
   assert sensor.data.found is not None
   touching = (sensor.data.found > 0).any(dim=-1)
+  if ready_attr is not None:
+    ready = getattr(env, ready_attr, None)
+    if ready is not None:
+      touching = touching & ready
   new_touch = touching & ~claimed
   setattr(env, state_attr, claimed | touching)
   return new_touch.float()
+
+
+def first_ball_kick_reward(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  speed_threshold: float = 0.2,
+  state_attr: str = "contact_reward_claimed",
+  ready_attr: str | None = None,
+) -> torch.Tensor:
+  """One-shot reward the first step the ball's speed exceeds
+  ``speed_threshold`` (i.e. it was struck), not again until the ball is
+  repositioned.
+
+  Uses ball velocity instead of a foot/ball contact sensor: a fast strike
+  can separate within a single RL step's physics substeps, which a contact
+  sensor (sampled once per RL step) can silently miss even though the kick
+  was genuine. Ball velocity persists past the moment of contact, so a real
+  kick is never missed here regardless of how quickly it separates.
+
+  Same one-shot-per-life semantics as ``first_object_contact_reward``: the
+  claim flag (``state_attr`` on ``env``) is cleared by
+  ``_place_ball_near_robot`` (mdp/events.py) whenever the ball's position is
+  reset, so a fresh kick after the next reset earns the reward again.
+
+  ``ready_attr`` is an optional extra gate, see ``first_object_contact_reward``;
+  unused by the kick task.
+  """
+  claimed = getattr(env, state_attr, None)
+  if claimed is None:
+    claimed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
+  kicked = ball_speed > speed_threshold
+  if ready_attr is not None:
+    ready = getattr(env, ready_attr, None)
+    if ready is not None:
+      kicked = kicked & ready
+  new_kick = kicked & ~claimed
+  setattr(env, state_attr, claimed | kicked)
+  return new_kick.float()
+
+
+def standing_still_penalty(
+  env: ManagerBasedRlEnv,
+  anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+  vel_threshold: float = 0.15,
+  state_attr: str = "contact_reward_claimed",
+) -> torch.Tensor:
+  """Flat penalty for near-zero root speed before the ball has been touched
+  (in the current ball "life" -- see ``first_object_contact_reward``'s
+  ``contact_reward_claimed``, cleared on every ball reset, so this re-applies
+  after every kick too, not just at episode start).
+
+  Flat (not proportional to how slow) so it can't be cheaply "paid off" by
+  drifting just above zero -- either the robot is genuinely moving toward the
+  ball or it eats the full penalty. Counters the standing-still local optimum
+  (avoiding fall/wrong-foot penalties by simply not doing anything) that kept
+  showing up even after several rounds of reward-scale fixes.
+  """
+  robot: Entity = env.scene[anchor_cfg.name]
+  speed = torch.norm(robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2], dim=-1)
+  claimed = getattr(env, state_attr, None)
+  not_touched_yet = torch.ones_like(speed, dtype=torch.bool) if claimed is None else ~claimed
+  standing_still = speed < vel_threshold
+  return (standing_still & not_touched_yet).float()
 
 
 def foot_medial_alignment(
@@ -386,17 +478,38 @@ def foot_medial_alignment(
   return torch.sum(medial_xy * direction, dim=-1)
 
 
+def _kick_dir_factor(
+  ball_vel_xy: torch.Tensor, kick_dir: torch.Tensor, sigma: float
+) -> torch.Tensor:
+  """Signed direction quality in [-1, 1]: +1 exact match with the target
+  direction, 0 at the angular-tolerance boundary, -1 opposite. Mirrors
+  mjxperiment kick.py's ``_kick_dir_factor`` exactly: a Gaussian centered on
+  the target direction, remapped from [0,1] to [-1,1] so kicks worse than the
+  tolerance actively score negative rather than merely "less positive".
+  """
+  speed = torch.norm(ball_vel_xy, dim=-1)
+  direction = ball_vel_xy / (speed.unsqueeze(-1) + 1e-6)
+  cos_angle = torch.clamp(torch.sum(direction * kick_dir, dim=-1), -1.0, 1.0)
+  angle_err = torch.acos(cos_angle)
+  f_dir = torch.exp(-0.5 * torch.square(angle_err / sigma))
+  return (f_dir - 0.5) * 2.0
+
+
 def kick_impact_reward(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg,
   vel_weight: float = 1.0,
   height_weight: float = 1.0,
   saturation_scale: float = 5.0,
+  dir_sigma: float = 0.5,
 ) -> torch.Tensor:
   """Reward ball speed + height while a post-contact reward window is open,
   scaled by how well the foot was aligned with the ball at the moment of
-  contact -- so a proper side-foot kick earns much more than a toe-poke/front
-  kick for the same ball speed/height.
+  contact (so a proper side-foot kick earns much more than a toe-poke/front
+  kick for the same ball speed/height) AND by how well the ball's resulting
+  direction matches the target (``env.kick_dir_world``) -- a kick outside the
+  direction tolerance doesn't just earn less, it goes negative (see
+  ``_kick_dir_factor``), so direction can't be ignored in favor of raw power.
 
   Raw ``vel_weight*speed + height_weight*height`` is unbounded and was
   swamping the AMP style term (hard-capped to ``[0, amp_reward_coef]``) in the
@@ -407,6 +520,12 @@ def kick_impact_reward(
   hardest possible kick still only reaches ~2 -- the same order of magnitude as
   the other reward terms instead of dwarfing them.
 
+  ``dir_sigma`` is meant to be narrowed over training via a curriculum
+  (``anneal_reward_param_linear``, mdp/curriculums.py) alongside
+  ``kick_direction_reward``'s own sigma -- generous early (a wide "doesn't
+  count against you" cone) so the robot can discover kicking at all, then
+  tightening to demand real directional accuracy for full credit.
+
   The window (``env.kick_timer``, steps remaining) and the frozen style
   multiplier (``env.kick_style`` in [0, 1], see ``foot_medial_alignment``) are
   owned and set by the ``kick_contact_cycle`` event (mdp/events.py) -- opened on
@@ -416,7 +535,8 @@ def kick_impact_reward(
   """
   ball: Entity = env.scene[ball_cfg.name]
   timer = getattr(env, "kick_timer", None)
-  ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
+  ball_vel_xy = ball.data.root_link_lin_vel_w[:, :2]
+  ball_speed = torch.norm(ball_vel_xy, dim=-1)
   if timer is None:
     return torch.zeros_like(ball_speed)
   ball_height = torch.clamp(ball.data.root_link_pos_w[:, 2] - BALL_RADIUS, min=0.0)
@@ -425,7 +545,45 @@ def kick_impact_reward(
   style = torch.ones_like(ball_speed) if style is None else style
   raw = vel_weight * ball_speed + height_weight * ball_height
   bounded = torch.tanh(raw / saturation_scale)
-  return torch.where(active, style * bounded, torch.zeros_like(ball_speed))
+
+  kick_dir = getattr(env, "kick_dir_world", None)
+  dir_factor = (
+    torch.ones_like(ball_speed)
+    if kick_dir is None
+    else _kick_dir_factor(ball_vel_xy, kick_dir, dir_sigma)
+  )
+  return torch.where(active, style * bounded * dir_factor, torch.zeros_like(ball_speed))
+
+
+def kick_direction_reward(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  sigma: float = 0.5,
+  min_ball_speed: float = 0.1,
+) -> torch.Tensor:
+  """Reward/penalize the ball's post-kick velocity direction against a
+  randomly sampled per-env target (``env.kick_dir_world``, a world-frame unit
+  vector resampled every time the ball is repositioned -- see
+  ``_sample_kick_dir``/``_place_ball_near_robot`` in mdp/events.py).
+
+  Signed via ``_kick_dir_factor``: +1 for an exact match, 0 at the tolerance
+  boundary, down to -1 for the opposite direction -- a kick outside the
+  tolerance is an active penalty, not just a missed reward. Gated to the same
+  post-contact window as ``kick_impact_reward`` and to the ball actually
+  moving (a stationary ball has no meaningful "direction"). ``sigma`` (the
+  angular tolerance, radians) is meant to be narrowed over training via a
+  curriculum (``anneal_reward_param_linear``, mdp/curriculums.py).
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  timer = getattr(env, "kick_timer", None)
+  kick_dir = getattr(env, "kick_dir_world", None)
+  ball_vel_xy = ball.data.root_link_lin_vel_w[:, :2]
+  ball_speed = torch.norm(ball_vel_xy, dim=-1)
+  if timer is None or kick_dir is None:
+    return torch.zeros_like(ball_speed)
+  dir_factor = _kick_dir_factor(ball_vel_xy, kick_dir, sigma)
+  active = (timer > 0) & (ball_speed > min_ball_speed)
+  return torch.where(active, dir_factor, torch.zeros_like(dir_factor))
 
 
 def foot_medial_alignment_penalty(
@@ -434,6 +592,7 @@ def foot_medial_alignment_penalty(
   foot_cfg: SceneEntityCfg,
   medial_sign: float,
   close_dist: float = 0.5,
+  ready_attr: str | None = None,
 ) -> torch.Tensor:
   """Penalize the foot's inside (medial) edge not facing the ball when close.
 
@@ -442,6 +601,12 @@ def foot_medial_alignment_penalty(
   between the foot's medial axis and the foot->ball direction), so 0 when the
   inside of the foot points straight at the ball and up to 2 when it faces
   directly away.
+
+  ``ready_attr`` is an optional extra gate: if set to an attribute name that
+  exists on ``env`` and is truthy for a given env, the penalty only applies
+  while that flag is set. Unused by the kick task (no such gating attribute
+  is set there anymore, so this fires whenever close to the ball regardless
+  of what the robot is doing).
   """
   robot: Entity = env.scene[foot_cfg.name]
   ball: Entity = env.scene[ball_cfg.name]
@@ -452,7 +617,12 @@ def foot_medial_alignment_penalty(
 
   align = foot_medial_alignment(foot_pos, foot_quat, ball.data.root_link_pos_w[:, :2], medial_sign)
   misalign = 1.0 - torch.clamp(align, -1.0, 1.0)
-  return misalign * (dist < close_dist).float()
+  active = dist < close_dist
+  if ready_attr is not None:
+    ready = getattr(env, ready_attr, None)
+    if ready is not None:
+      active = active & ready
+  return misalign * active.float()
 
 
 def self_collision_cost(

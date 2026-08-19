@@ -81,27 +81,40 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
   experiment/wandb namespace so kick runs don't land in the locomotion
   project's dashboard.
 
-  amp_reward_coef / amp_task_reward_lerp bumped again (was 0.1/0.75, the
-  locomotion defaults): ``Discriminator.predict_amp_reward`` combines the two
-  additively -- ``(1-lerp)*amp_reward + lerp*task_reward`` -- with NO
-  renormalization, while the AMP term alone is hard-clamped to
-  ``[0, amp_reward_coef]``, so 0.1/0.75 left style numerically irrelevant
-  (0.025/step vs task terms reaching several units) and the policy learned a
-  task-optimal but styleless toe-poke/dribble. An earlier, more aggressive bump
-  (1.0/0.3, 70% style) overshot into a different failure: standing still scored
-  well against the Kick clips' calmer frames while dodging every task penalty,
-  so the policy stopped kicking altogether. Trying the in-between setting
-  (0.3/0.5, 50% style) that was flagged but never actually run last time --
-  now combined with the tightened task rewards (one-shot contact reward, style-
-  gated kick_impact, bumped move_to_ball) that should make idling far less
-  attractive regardless of how much style contributes.
+  amp_reward_coef / amp_task_reward_lerp history (``Discriminator.
+  predict_amp_reward`` combines the two additively -- ``(1-lerp)*amp_reward +
+  lerp*task_reward`` -- with NO renormalization, while the AMP term alone is
+  hard-clamped to ``[0, amp_reward_coef]``): 0.1/0.75 (locomotion defaults)
+  left style numerically irrelevant (0.025/step vs task terms reaching
+  several units) and the policy learned a task-optimal but styleless
+  toe-poke/dribble. 1.0/0.3 (70% style) overshot the other way: standing
+  still scored well against the Kick clips' calmer frames while dodging
+  every task penalty, so the policy stopped kicking altogether. 0.3/0.5 (50%
+  style) was tried twice -- both times the policy learned style (AMP-like
+  motion) without learning the task (approach/kick), so it was dropped to
+  0.25/0.7 (~30% style), raised slightly to 0.25/0.6 (~40% style),
+  amp_reward_coef lowered a bit further to 0.2/0.6 (~32% style), lerp raised
+  back to 0.2/0.75 (~20% style), amp_reward_coef lowered again to 0.15/0.75
+  (~15% style), 0.2/0.9 (~8% style), 0.2/0.85 (~12% style), 0.2/0.8
+  (~16% style), 0.2/0.7 (~24% style), 0.2/0.6 (~32% style), amp_reward_coef
+  lowered to 0.13/0.6 (~22% style) -- the policy still looked like it was
+  ignoring style at that point, so lerp is now lowered further to 0.13/0.45
+  (~40% style) to give the AMP term more relative pull.
   """
   base = piplus_amp_ppo_runner_cfg()
+  # init_std=2.0 (was 1.0): a wider initial action-noise distribution for
+  # more exploration early in training.
+  kick_actor = dataclasses.replace(
+    base.actor,
+    distribution_cfg={**base.actor.distribution_cfg, "init_std": 2.0},
+  )
   return dataclasses.replace(
     base,
+    actor=kick_actor,
     experiment_name="piplus_amp_kick",
     wandb_project="piplus_amp_kick",
     amp_motion_files=os.path.normpath(os.path.join(_MOTION_DATA_DIR, "KickAndRun")),
-    amp_reward_coef=0.3,
-    amp_task_reward_lerp=0.5,
+    amp_reward_coef=0.13,
+    amp_task_reward_lerp=0.45,
+    save_interval=500,
   )

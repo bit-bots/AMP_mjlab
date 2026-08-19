@@ -102,7 +102,20 @@ class AMPOnPolicyRunner(AmpOnPolicyRunner):
       obs_normalizer.to(self.device)
 
   def save(self, path: str, infos=None):
-    super().save(path, infos)
+    # super().save() uploads the raw .pt checkpoint to wandb via
+    # self.writer.save_model() when logger_type=="wandb" -- suppress just
+    # that upload (checkpoint still saved locally via torch.save inside
+    # super().save()) by temporarily no-opping it, so it doesn't affect the
+    # ONNX-export upload below or any other wandb logging (metrics, etc.).
+    if self.logger_type == "wandb" and self.writer is not None:
+      _orig_save_model = self.writer.save_model
+      self.writer.save_model = lambda *a, **k: None
+      try:
+        super().save(path, infos)
+      finally:
+        self.writer.save_model = _orig_save_model
+    else:
+      super().save(path, infos)
     policy_path = path.split("model")[0]
     filename = "policy.onnx"
     self._export_policy_to_onnx(policy_path, filename)

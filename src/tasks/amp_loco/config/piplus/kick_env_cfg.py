@@ -22,9 +22,11 @@ and WHEN that motion fires:
 """
 
 import copy
+import math
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -46,9 +48,20 @@ BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball
 RIGHT_FOOT_SUBTREE = "r_ankle_roll_link"
 LEFT_FOOT_SUBTREE = "l_ankle_roll_link"
 
-# Ball spawn/respawn geometry (mjxperiment kick.py: ball_distance, ball_spawn_cone).
-BALL_DIST_RANGE = (0.4, 1.2)
-BALL_SPAWN_CONE_DEG = 90.0
+# Ball spawn/respawn geometry: forward distance from the robot + a
+# distance-scaled lateral offset (see _place_ball_near_robot, mdp/events.py)
+# -- always somewhere in front of the robot, narrower close-in and wider
+# further out. Replaces an earlier design that walked the robot to a
+# structured "approach point" behind the ball before allowing contact; that
+# extra state machine was dropped as unnecessary -- the ordinary
+# move_to_ball/torso_orient_to_ball rewards already handle getting the robot
+# to the ball without it.
+BALL_DIST_RANGE = (0.3, 1.0)
+BALL_LATERAL_RANGE = (0.2, 0.7)  # (near, far) lateral half-width, meters.
+# Target kick direction sampled within the robot's heading at spawn time +/-
+# this cone -- a direction the robot has a plausible chance of actually
+# hitting from its current orientation, rather than a fully arbitrary one.
+KICK_DIR_CONE_DEG = 80.0
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
@@ -61,6 +74,14 @@ FOOT_ALIGNMENT_CLOSE_DIST = 0.9
 # center. -Y is the robot's right in the torso's local frame (matches
 # foot_medial_alignment's convention: r_ankle_roll_link sits on the -Y side).
 KICK_APPROACH_OFFSET_B = (0.0, -0.20, 0.0)
+# kick_direction_reward/kick_impact_reward's angular tolerance (Gaussian
+# sigma, radians), narrowed over training via a curriculum -- see
+# anneal_reward_param_linear below. Was 10.0/0.25 (~direction essentially
+# ignored -> ~14deg) from an earlier, much longer curriculum window; now a
+# tighter 45deg -> 5deg range, sigma expressed directly in radians via
+# math.radians -- see _kick_dir_factor in rewards.py.
+KICK_DIR_SIGMA_START = math.radians(45.0)
+KICK_DIR_SIGMA_END = math.radians(5.0)
 
 
 def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -106,6 +127,19 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       },
     ),
+    # One-hot [kicking, post_kick] -- see kick_state_obs docstring. No
+    # noise: this is task-internal state, not a perception.
+    "kick_state": ObservationTermCfg(func=amp_mdp.kick_state_obs),
+    # Target kick direction (env.kick_dir_world), rotated into the robot
+    # base's yaw frame -- see kick_dir_heading_b docstring. Without this the
+    # policy has no way to know which direction is currently being asked
+    # for (kick_direction/kick_impact score against it, but nothing exposed
+    # it as an observation before). No noise: a commanded target, not a
+    # perception.
+    "kick_dir_b": ObservationTermCfg(
+      func=amp_mdp.kick_dir_heading_b,
+      params={"robot_cfg": SceneEntityCfg("robot")},
+    ),
   }
   for grp_name in ("actor", "critic"):
     grp = cfg.observations[grp_name]
@@ -123,23 +157,40 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # --- Drop velocity-tracking rewards; add ball-approach + kick rewards ----
   for name in ("track_anchor_linear_velocity", "track_anchor_angular_velocity", "foot_slip"):
     cfg.rewards.pop(name, None)
-  # Bumped 5x (was 1.0): unlike the sparse contact/impact rewards this one fires
-  # every step (dense, bounded [-0.5, 1.0]), so it doesn't need a 40x-style jump
-  # to matter -- just enough to make closing the distance clearly worth more
-  # than the safe standing-still local optimum.
+  # History: 1.0 -> 5.0 -> 12.0 -> 6.0 -> 12.0 -> 6.0 -> 4.0 -> 6.0 -> 4.0 --
+  # simplified back to a direct move-toward-the-ball reward (no more
+  # structured "approach point" state, see BALL_DIST_RANGE/BALL_LATERAL_RANGE
+  # above) now that kick_contact_cycle no longer gates contact on a
+  # position/orientation "ready" state -- the robot may kick as soon as it
+  # reaches the ball, so there's nothing left for an approach point to set up.
   cfg.rewards["move_to_ball"] = RewardTermCfg(
     func=amp_mdp.move_toward_object,
-    weight=5.0,
+    weight=4.0,
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
-      "max_speed": 0.5,
       "offset_b": KICK_APPROACH_OFFSET_B,
+      "alignment_power": 3.0,
+    },
+  )
+  # Significant flat penalty for standing still before the ball's been
+  # touched (per ball "life", so this re-arms after every kick too) -- the
+  # standing-still local optimum kept surviving previous reward-scale fixes,
+  # so this directly targets it rather than relying on move_to_ball's
+  # incentive alone.
+  cfg.rewards["standing_still"] = RewardTermCfg(
+    func=amp_mdp.standing_still_penalty,
+    weight=-5.0,
+    params={
+      "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
+      "vel_threshold": 0.15,
     },
   )
   # Small dense reward for facing the ball (mirrors mjxperiment's
-  # _reward_orient_to_ball) -- helps line up a proper kick approach rather than
-  # arriving side-on or backing into it.
+  # _reward_orient_to_ball) -- helps line up a proper kick approach rather
+  # than arriving side-on or backing into it. Plain "face the ball" the whole
+  # time now (no more switching to face the target kick direction once
+  # "ready" -- that state no longer exists, see move_to_ball above).
   cfg.rewards["torso_orient_to_ball"] = RewardTermCfg(
     func=amp_mdp.torso_orient_to_object,
     weight=0.5,
@@ -175,20 +226,27 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # very unattractive in expectation, so the ball-contact/impact incentives need
   # to be large enough to actually outweigh that safe local optimum.
   #
-  # first_object_contact_reward (not object_contact_reward): the continuous
-  # per-step version paid out for every step of contact, so the policy learned
-  # to just rest the foot on the ball instead of kicking it. One-shot per ball
-  # "life" removes that exploit while keeping the same weight.
+  # first_ball_kick_reward (not object_contact_reward, not
+  # first_object_contact_reward): the continuous per-step version paid out
+  # for every step of contact, so the policy learned to just rest the foot on
+  # the ball instead of kicking it -- one-shot per ball "life" removes that
+  # exploit. Ball-velocity-based (not the r_foot_ball_contact sensor): a fast
+  # kick can make contact and separate again within a single RL step's
+  # physics substeps, which the sensor (sampled once per RL step) can
+  # silently miss even though the kick was genuine -- confirmed empirically,
+  # see first_ball_kick_reward's docstring (mdp/rewards.py).
   cfg.rewards["right_foot_ball_contact"] = RewardTermCfg(
-    func=amp_mdp.first_object_contact_reward,
+    func=amp_mdp.first_ball_kick_reward,
     weight=80.0,
-    params={"sensor_name": "r_foot_ball_contact"},
+    params={"ball_cfg": SceneEntityCfg(BALL_NAME)},
   )
   # weight=10.0 (bumped 5x from 2.0): kick_impact's raw speed+height term is
   # tanh-saturated to [0, 1) (see rewards.py), so this weight IS the max
   # achievable reward (~10.0 for a maxed-out kick) instead of an unbounded
   # multiplier -- still bounded/predictable, just a stronger incentive to
-  # actually connect well rather than settle for a token tap.
+  # actually connect well rather than settle for a token tap. Also gated by
+  # dir_sigma (see _kick_dir_factor, rewards.py): a wrong-direction kick isn't
+  # just under-rewarded, it goes negative once outside the tolerance cone.
   cfg.rewards["kick_impact"] = RewardTermCfg(
     func=amp_mdp.kick_impact_reward,
     weight=10.0,
@@ -197,6 +255,20 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "vel_weight": 2.0,
       "height_weight": 5.0,
       "saturation_scale": 5.0,
+      "dir_sigma": KICK_DIR_SIGMA_START,
+    },
+  )
+  # Rewards/penalizes the ball's post-kick direction against a randomly
+  # sampled target (env.kick_dir_world, resampled every ball reset -- see
+  # events.py). sigma starts very broad (direction essentially doesn't matter)
+  # and narrows over training via the narrow_kick_direction curriculum below.
+  cfg.rewards["kick_direction"] = RewardTermCfg(
+    func=amp_mdp.kick_direction_reward,
+    weight=2.0,
+    params={
+      "ball_cfg": SceneEntityCfg(BALL_NAME),
+      "sigma": KICK_DIR_SIGMA_START,
+      "min_ball_speed": 0.1,
     },
   )
   # Bumped (was -0.2): a proper side-foot kick now pays off twice over --
@@ -215,6 +287,10 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Left-foot/ball contact ends the episode -----------------------------
+  # (Touching the ball before being positioned/aligned used to also end the
+  # episode via a "premature touch" termination -- removed along with the
+  # approach-point state machine it depended on; the robot may now kick the
+  # ball at any time, so there's no "too early" to penalize.)
   cfg.terminations["left_foot_touched_ball"] = TerminationTermCfg(
     func=amp_mdp.object_contact,
     params={"sensor_name": "l_foot_ball_contact"},
@@ -228,7 +304,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "robot_cfg": SceneEntityCfg("robot"),
       "ball_cfg": SceneEntityCfg(BALL_NAME),
       "dist_range": BALL_DIST_RANGE,
-      "cone_deg": BALL_SPAWN_CONE_DEG,
+      "lateral_range": BALL_LATERAL_RANGE,
+      "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
     },
   )
   cfg.events["kick_contact_cycle"] = EventTermCfg(
@@ -237,12 +314,12 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "robot_cfg": SceneEntityCfg("robot"),
       "ball_cfg": SceneEntityCfg(BALL_NAME),
-      "contact_sensor_name": "r_foot_ball_contact",
       "foot_body_name": RIGHT_FOOT_SUBTREE,
       "medial_sign": 1.0,  # +Y is medial for the right foot (see rewards.py docstring).
       "window_s": KICK_WINDOW_S,
       "dist_range": BALL_DIST_RANGE,
-      "cone_deg": BALL_SPAWN_CONE_DEG,
+      "lateral_range": BALL_LATERAL_RANGE,
+      "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
     },
   )
 
@@ -258,5 +335,44 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["init_motion_loader"].params["motion_dir"] = _motion_dir
   cfg.events["init_motion_loader"].params["recovery_dir"] = _motion_dir
   cfg.events["reset_from_motion"].params["motion_dir"] = _motion_dir
+
+  # --- Curricula -------------------------------------------------------------
+  # Tighten foot-slip/torque penalties at iteration 10000, once kicking is
+  # established, to clean up the gait rather than fight exploration early on.
+  cfg.curriculum["bump_penalties"] = CurriculumTermCfg(
+    func=amp_mdp.bump_reward_weight_at_step,
+    params={
+      "reward_names": ["foot_slip", "joint_torques_l2"],
+      "step": 10000 * 24,
+      "scale": 3.0,
+    },
+  )
+  # Narrow kick_direction_reward's tolerance (45deg -> 5deg) over iterations
+  # 2000-7000 -- pulled forward from 10000-15000 to start much earlier
+  # (kept the same 5000-iteration span). kick_impact's own dir_sigma is
+  # narrowed on the exact same schedule so the "wrong direction gets
+  # penalized" gate in both terms tightens together.
+  cfg.curriculum["narrow_kick_direction"] = CurriculumTermCfg(
+    func=amp_mdp.anneal_reward_param_linear,
+    params={
+      "reward_name": "kick_direction",
+      "param_name": "sigma",
+      "start_step": 2000 * 24,
+      "end_step": 7000 * 24,
+      "start_value": KICK_DIR_SIGMA_START,
+      "end_value": KICK_DIR_SIGMA_END,
+    },
+  )
+  cfg.curriculum["narrow_kick_impact_dir_gate"] = CurriculumTermCfg(
+    func=amp_mdp.anneal_reward_param_linear,
+    params={
+      "reward_name": "kick_impact",
+      "param_name": "dir_sigma",
+      "start_step": 2000 * 24,
+      "end_step": 7000 * 24,
+      "start_value": KICK_DIR_SIGMA_START,
+      "end_value": KICK_DIR_SIGMA_END,
+    },
+  )
 
   return cfg

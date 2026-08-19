@@ -277,10 +277,34 @@ def randomize_imu_mounting_bias(
 # ------------------------------------------------------------------
 # Kick task: ball spawn / respawn
 #
-# Spawn geometry (distance + heading cone around the robot) mirrors
-# mjxperiment's kick.py ``_sample_ball_offset``; placement is otherwise
-# convention-free (world-frame xy + fixed z=radius, identity orientation).
+# Placement is a forward distance + a lateral (left/right) offset relative
+# to the robot's current heading, not a full cone/circle around it -- the
+# ball always sits somewhere in front of the robot, closer to dead-ahead
+# when near and increasingly spread side-to-side the farther out it is.
+# Placement itself is otherwise convention-free (world-frame xy + fixed
+# z=radius, identity orientation).
 # ------------------------------------------------------------------
+
+
+def _sample_kick_dir(
+    n: int,
+    device: str,
+    heading: torch.Tensor | None = None,
+    cone_deg: float | None = None,
+) -> torch.Tensor:
+    """Target kick direction, unit vector (n, 2) in the world xy plane.
+
+    If ``heading``/``cone_deg`` are given, samples within ``heading +/-
+    cone_deg`` (a target direction the robot has a plausible chance of
+    actually hitting from its current orientation); otherwise fully
+    uniform over [-pi, pi] (used only for the initial value before any
+    reset has run)."""
+    if heading is None or cone_deg is None:
+        angle = sample_uniform(-math.pi, math.pi, (n,), device=device)
+    else:
+        cone = math.radians(cone_deg)
+        angle = heading + sample_uniform(-cone, cone, (n,), device=device)
+    return torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
 
 
 def _place_ball_near_robot(
@@ -289,16 +313,28 @@ def _place_ball_near_robot(
     robot: Entity,
     ball: Entity,
     dist_range: tuple[float, float],
-    cone_deg: float,
+    lateral_range: tuple[float, float],
+    kick_dir_cone_deg: float,
 ) -> None:
     n = env_ids.shape[0]
     robot_xy = robot.data.root_link_pos_w[env_ids, :2]
     robot_yaw = robot.data.heading_w[env_ids]
 
     dist = sample_uniform(dist_range[0], dist_range[1], (n,), device=env.device)
-    cone = math.radians(cone_deg)
-    angle = robot_yaw + sample_uniform(-cone, cone, (n,), device=env.device)
-    offset = torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1) * dist.unsqueeze(-1)
+    # Lateral spread scales linearly with forward distance: narrow
+    # (+/- lateral_range[0]) right in front of the robot, wide
+    # (+/- lateral_range[1]) at the far end of dist_range.
+    span = dist_range[1] - dist_range[0]
+    t = (dist - dist_range[0]) / span if span > 0 else torch.zeros_like(dist)
+    width = lateral_range[0] + t * (lateral_range[1] - lateral_range[0])
+    side = sample_uniform(-1.0, 1.0, (n,), device=env.device) * width
+
+    # forward/right in world xy, from the robot's current heading. -Y in the
+    # robot's local frame is "right" (matches foot_medial_alignment's
+    # convention elsewhere), so right_world = R(yaw) @ (0,-1) = (sin,-cos).
+    forward = torch.stack([torch.cos(robot_yaw), torch.sin(robot_yaw)], dim=-1)
+    right = torch.stack([torch.sin(robot_yaw), -torch.cos(robot_yaw)], dim=-1)
+    offset = forward * dist.unsqueeze(-1) + right * side.unsqueeze(-1)
 
     pose = torch.zeros((n, 7), device=env.device)
     pose[:, 0:2] = robot_xy + offset
@@ -312,6 +348,13 @@ def _place_ball_near_robot(
     # first_object_contact_reward's contact_reward_claimed (mdp/rewards.py).
     if hasattr(env, "contact_reward_claimed"):
         env.contact_reward_claimed[env_ids] = False
+    # ...and a fresh target kick direction (kick_direction_reward, mdp/rewards.py),
+    # sampled relative to the robot's heading at THIS reposition (not its
+    # heading at some later point), so it stays a plausible target.
+    if hasattr(env, "kick_dir_world"):
+        env.kick_dir_world[env_ids] = _sample_kick_dir(
+            n, env.device, heading=robot_yaw, cone_deg=kick_dir_cone_deg
+        )
 
 
 def reset_ball_near_robot(
@@ -319,10 +362,12 @@ def reset_ball_near_robot(
     env_ids: torch.Tensor | None,
     robot_cfg: SceneEntityCfg,
     ball_cfg: SceneEntityCfg,
-    dist_range: tuple[float, float] = (0.4, 1.2),
-    cone_deg: float = 90.0,
+    dist_range: tuple[float, float] = (0.3, 1.0),
+    lateral_range: tuple[float, float] = (0.2, 0.7),
+    kick_dir_cone_deg: float = 80.0,
 ) -> None:
-    """Reset event: spawn the ball at a random distance/heading around the robot.
+    """Reset event: spawn the ball in front of the robot (forward distance +
+    distance-scaled lateral offset, see ``_place_ball_near_robot``).
 
     Must run AFTER any reset event that repositions the robot (e.g.
     ``reset_from_motion_data``) -- ``EntityData`` documents that write_* calls
@@ -338,7 +383,7 @@ def reset_ball_near_robot(
     env.sim.forward()
     robot: Entity = env.scene[robot_cfg.name]
     ball: Entity = env.scene[ball_cfg.name]
-    _place_ball_near_robot(env, env_ids, robot, ball, dist_range, cone_deg)
+    _place_ball_near_robot(env, env_ids, robot, ball, dist_range, lateral_range, kick_dir_cone_deg)
     if hasattr(env, "kick_timer"):
         env.kick_timer[env_ids] = 0
     if hasattr(env, "kick_style"):
@@ -346,29 +391,73 @@ def reset_ball_near_robot(
 
 
 class kick_contact_cycle:
-    """Contact-driven ball cycle: open a reward-farming window on right-foot/ball
-    contact, hold it for ``window_s`` seconds, then reset the ball (new random
-    position near the robot + zero velocity) WITHOUT ending the episode.
+    """Contact-driven ball cycle: kicking -> post-kick -> kicking.
 
-    No more distance-based "ball rolled too far" respawn/penalty -- the ball only
-    ever moves once the robot actually kicks it, making the whole ball-reset
-    lifecycle purely contact-driven. ``env.kick_timer`` (steps remaining in the
-    window) and ``env.kick_style`` (the foot/ball alignment quality at the moment
-    of contact, in [0, 1], frozen for the whole window) are shared with
-    ``kick_impact_reward`` (mdp/rewards.py), which reads them to gate/scale the
-    ball speed+height reward; this event owns writing both. Use with
+    **kicking** (``env.kick_timer`` == 0). The robot may strike the ball at
+    any time -- there's no separate "positioned/aligned" gate before contact
+    counts. Getting the robot to actually walk up and line up a good strike
+    is left entirely to the ordinary rewards (``move_toward_object``,
+    ``torso_orient_to_object``, ``foot_medial_alignment_penalty``), not a
+    state machine here.
+
+    **post-kick** (``env.kick_timer`` > 0). Entered once the ball's speed
+    exceeds ``impact_speed_threshold`` while kicking; holds for ``window_s``
+    seconds so the robot can "farm" reward from the kick's aftermath, then
+    the ball resets (new random position in front of the robot + zero
+    velocity, fresh target kick direction) WITHOUT ending the episode, and
+    the cycle returns to kicking.
+
+    ``env.kick_timer`` (steps remaining in the post-kick window) and
+    ``env.kick_style`` (the foot/ball alignment quality at the moment of
+    contact, in [0, 1], frozen for the whole window) are shared with
+    ``kick_impact_reward`` (mdp/rewards.py), which reads them to gate/scale
+    the ball speed+height reward; this event owns writing both. Use with
     ``mode="step"``.
     """
 
     def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
+        self._env = env
         self._robot: Entity = env.scene[cfg.params["robot_cfg"].name]
         self._ball: Entity = env.scene[cfg.params["ball_cfg"].name]
         self._foot_body_id = self._robot.find_bodies(cfg.params["foot_body_name"])[0][0]
         self._medial_sign = cfg.params.get("medial_sign", 1.0)
+        self._impact_speed_threshold = cfg.params.get("impact_speed_threshold", 0.2)
         window_s = cfg.params.get("window_s", 2.0)
         self._window_steps = max(1, round(window_s / env.step_dt))
+        self._dist_range = cfg.params.get("dist_range", (0.3, 1.0))
+        self._lateral_range = cfg.params.get("lateral_range", (0.2, 0.7))
+        self._kick_dir_cone_deg = cfg.params.get("kick_dir_cone_deg", 80.0)
         env.kick_timer = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         env.kick_style = torch.zeros(env.num_envs, device=env.device)
+        env.kick_dir_world = _sample_kick_dir(env.num_envs, env.device)
+
+    def reset(self, env_ids) -> None:
+        """No-op: this event has no instance state of its own that needs
+        clearing (kick_timer/kick_style/kick_dir_world all live on ``env``
+        and are cleared/reset by ``_place_ball_near_robot`` whenever the ball
+        is repositioned). Required anyway -- EventManager only adds a
+        class-based term to its debug_vis registry when it also defines
+        ``reset`` (see ``EventManager._prepare_terms``); without this, our
+        arrow never rendered even though everything downstream was correct.
+        """
+        del env_ids
+
+    def debug_vis(self, visualizer) -> None:
+        """Draw an arrow at the ball pointing along the current target kick
+        direction. Auto-invoked by EventManager.debug_vis for any
+        class-based event term that defines this method -- no extra cfg flag
+        needed.
+        """
+        env = self._env
+        ball_pos = self._ball.data.root_link_pos_w
+        kick_dir = env.kick_dir_world
+        length = 0.5
+        for env_idx in visualizer.get_env_indices(env.num_envs):
+            start = ball_pos[env_idx]
+            end = start.clone()
+            end[0] = start[0] + kick_dir[env_idx, 0] * length
+            end[1] = start[1] + kick_dir[env_idx, 1] * length
+            visualizer.add_arrow(start, end, color=(1.0, 0.6, 0.0, 0.9), width=0.015, label="kick_dir")
 
     def __call__(
         self,
@@ -376,21 +465,34 @@ class kick_contact_cycle:
         env_ids: torch.Tensor | None,
         robot_cfg: SceneEntityCfg,
         ball_cfg: SceneEntityCfg,
-        contact_sensor_name: str,
         foot_body_name: str,
         medial_sign: float = 1.0,
+        impact_speed_threshold: float = 0.2,
         window_s: float = 2.0,
-        dist_range: tuple[float, float] = (0.4, 1.2),
-        cone_deg: float = 90.0,
+        dist_range: tuple[float, float] = (0.3, 1.0),
+        lateral_range: tuple[float, float] = (0.2, 0.7),
+        kick_dir_cone_deg: float = 80.0,
     ) -> None:
-        del env_ids, robot_cfg, ball_cfg, foot_body_name, medial_sign, window_s
-        # Unused; resolved once in __init__.
-        sensor = env.scene[contact_sensor_name]
-        assert sensor.data.found is not None
-        touching = (sensor.data.found > 0).any(dim=-1)
+        del (
+            env_ids, robot_cfg, ball_cfg, foot_body_name, medial_sign,
+            impact_speed_threshold, window_s, dist_range, lateral_range, kick_dir_cone_deg,
+        )
+        # All params unused here; resolved once in __init__.
+
+        # Ball velocity, not a foot/ball contact sensor: a fast strike can
+        # make contact and separate again within a single RL step's physics
+        # substeps, which a contact sensor (sampled once per RL step, after
+        # all substeps) can silently miss even though the ball was genuinely
+        # struck -- confirmed empirically (ball visibly moves, sensor never
+        # shows touching that step). Ball velocity is an integrated physics
+        # state that persists past the moment of contact, so it doesn't have
+        # this blind spot. See first_ball_kick_reward (mdp/rewards.py), which
+        # uses the same signal.
+        ball_speed = torch.norm(self._ball.data.root_link_lin_vel_w[:, :2], dim=-1)
+        kicked = ball_speed > self._impact_speed_threshold
 
         idle = env.kick_timer == 0
-        new_contact = touching & idle
+        new_contact = kicked & idle
         env.kick_timer = torch.where(
             new_contact, torch.full_like(env.kick_timer, self._window_steps), env.kick_timer
         )
@@ -412,4 +514,7 @@ class kick_contact_cycle:
         if not expiring.any():
             return
         ids = expiring.nonzero(as_tuple=False).squeeze(-1)
-        _place_ball_near_robot(env, ids, self._robot, self._ball, dist_range, cone_deg)
+        _place_ball_near_robot(
+            env, ids, self._robot, self._ball,
+            self._dist_range, self._lateral_range, self._kick_dir_cone_deg,
+        )
