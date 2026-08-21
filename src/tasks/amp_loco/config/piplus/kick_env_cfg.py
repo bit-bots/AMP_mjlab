@@ -76,12 +76,16 @@ FOOT_ALIGNMENT_CLOSE_DIST = 0.9
 KICK_APPROACH_OFFSET_B = (0.0, -0.20, 0.0)
 # kick_direction_reward/kick_impact_reward's angular tolerance (Gaussian
 # sigma, radians), narrowed over training via a curriculum -- see
-# anneal_reward_param_linear below. Was 10.0/0.25 (~direction essentially
-# ignored -> ~14deg) from an earlier, much longer curriculum window; now a
-# tighter 45deg -> 5deg range, sigma expressed directly in radians via
-# math.radians -- see _kick_dir_factor in rewards.py.
+# anneal_reward_param_linear below. Was 45deg -> 5deg over iterations
+# 2000-7000, but both rewards are SIGNED (_kick_dir_factor ranges -1 to +1),
+# and the log showed kick_impact/kick_direction flipping from clearly
+# positive to negative right at iteration 7000 -- exactly when the tolerance
+# finished tightening to a very demanding 5deg, before the policy could
+# reliably hit it, making kicking net-negative in expectation and collapsing
+# the incentive to commit to a full kick. Now a longer runway (2000-14000)
+# and a less extreme final tolerance (15deg).
 KICK_DIR_SIGMA_START = math.radians(45.0)
-KICK_DIR_SIGMA_END = math.radians(5.0)
+KICK_DIR_SIGMA_END = math.radians(15.0)
 
 
 def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -134,8 +138,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # base's yaw frame -- see kick_dir_heading_b docstring. Without this the
     # policy has no way to know which direction is currently being asked
     # for (kick_direction/kick_impact score against it, but nothing exposed
-    # it as an observation before). No noise: a commanded target, not a
-    # perception.
+    # it as an observation before). Critic gets this clean copy; actor's is
+    # overridden below with a noisy variant.
     "kick_dir_b": ObservationTermCfg(
       func=amp_mdp.kick_dir_heading_b,
       params={"robot_cfg": SceneEntityCfg("robot")},
@@ -153,6 +157,25 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Actor-only ball position noise (critic keeps ground truth): models a noisy
   # ball-tracking perception (e.g. vision) rather than perfect state.
   cfg.observations["actor"].terms["ball_pos_b"].noise = GaussianNoiseCfg(mean=0.0, std=0.07)
+  # Actor-only random observation delay, up to 0.2s (step_dt=0.02s -> 10
+  # steps), re-sampled per env every step (mjlab's built-in delay pipeline,
+  # see ObservationTermCfg.delay_min_lag/delay_max_lag) -- models the ball
+  # position lagging behind a real perception pipeline. Critic keeps
+  # instantaneous ground truth.
+  cfg.observations["actor"].terms["ball_pos_b"].delay_max_lag = 10
+  # Actor-only noisy kick-direction observation: Gaussian noise on the
+  # underlying yaw angle (not the raw vector -- see kick_dir_heading_b_noisy
+  # docstring for why), std ~5deg. Overrides the clean copy from the loop
+  # above (can't use the generic per-component GaussianNoiseCfg here without
+  # corrupting the unit-norm representation).
+  cfg.observations["actor"].terms["kick_dir_b"] = ObservationTermCfg(
+    func=amp_mdp.kick_dir_heading_b_noisy,
+    params={"robot_cfg": SceneEntityCfg("robot"), "std_rad": math.radians(5.0)},
+    # Same random up-to-0.2s delay as ball_pos_b above -- delaying a buffered
+    # sequence of already-unit-norm vectors just returns an older valid one,
+    # so this doesn't reintroduce the norm-corruption issue noise did.
+    delay_max_lag=10,
+  )
 
   # --- Drop velocity-tracking rewards; add ball-approach + kick rewards ----
   for name in ("track_anchor_linear_velocity", "track_anchor_angular_velocity", "foot_slip"):
@@ -210,6 +233,15 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "sensor_name": "feet_ground_contact",
       "asset_cfg": SceneEntityCfg("robot", site_names=SITE_NAMES),
     },
+  )
+  # Penalty (not mjlab's medium-range +1 reward) for a foot landing after too
+  # short a swing -- discourages a shuffling gait without also rewarding an
+  # exaggeratedly high-stepping one the way the mjlab version would. Bumped
+  # from -1.0 -- too weak to noticeably discourage shuffling.
+  cfg.rewards["foot_air_time"] = RewardTermCfg(
+    func=amp_mdp.foot_short_air_time_penalty,
+    weight=-3.0,
+    params={"sensor_name": "feet_ground_contact", "min_air_time": 0.25},
   )
   # Tiny torque penalty (not present anywhere in the kick task's reward set
   # before this): mdp.joint_torques_l2 is mjlab's built-in L2 actuator-force
@@ -337,28 +369,72 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["reset_from_motion"].params["motion_dir"] = _motion_dir
 
   # --- Curricula -------------------------------------------------------------
-  # Tighten foot-slip/torque penalties at iteration 10000, once kicking is
+  # Tighten the foot-slip penalty at iteration 10000, once kicking is
   # established, to clean up the gait rather than fight exploration early on.
+  # (joint_torques_l2 used to also bump here -- moved to its own, much
+  # earlier and stronger bump below, alongside action_rate_l2.)
   cfg.curriculum["bump_penalties"] = CurriculumTermCfg(
     func=amp_mdp.bump_reward_weight_at_step,
     params={
-      "reward_names": ["foot_slip", "joint_torques_l2"],
+      "reward_names": ["foot_slip"],
       "step": 10000 * 24,
       "scale": 3.0,
     },
   )
-  # Narrow kick_direction_reward's tolerance (45deg -> 5deg) over iterations
-  # 2000-7000 -- pulled forward from 10000-15000 to start much earlier
-  # (kept the same 5000-iteration span). kick_impact's own dir_sigma is
-  # narrowed on the exact same schedule so the "wrong direction gets
-  # penalized" gate in both terms tightens together.
+  # Tighten the torque/action-rate penalties at iteration 3000 -- much
+  # earlier than the foot-slip bump above, to clamp down on jerky/forceful
+  # motion well before the kick-direction curriculum below starts demanding
+  # accuracy. scale=8.0 turned out too strong; brought down to a middle
+  # ground between that and no bump at all.
+  cfg.curriculum["bump_control_penalties"] = CurriculumTermCfg(
+    func=amp_mdp.bump_reward_weight_at_step,
+    params={
+      "reward_names": ["joint_torques_l2", "action_rate_l2"],
+      "step": 3000 * 24,
+      "scale": 4.0,
+    },
+  )
+  # Completely drop right_foot_ball_contact's one-shot reward at iteration
+  # 2000 -- it exists purely to bootstrap discovering ball contact at all;
+  # once that's established this early, kick_impact/kick_direction (which
+  # score contact QUALITY, not just its occurrence) should drive the rest
+  # without a flat +80 one-off still on offer.
+  cfg.curriculum["drop_right_foot_ball_contact"] = CurriculumTermCfg(
+    func=amp_mdp.bump_reward_weight_at_step,
+    params={
+      "reward_names": ["right_foot_ball_contact"],
+      "step": 2000 * 24,
+      "scale": 0.0,
+    },
+  )
+  # Disable the left-foot/ball-contact termination at iteration 3000 -- it
+  # exists to steer the policy away from kicking with the wrong foot early
+  # on; once that's established, dropping it removes a fall-risk source
+  # (episode-ending on any left-foot brush) that's no longer needed to teach
+  # the distinction.
+  cfg.curriculum["drop_left_foot_termination"] = CurriculumTermCfg(
+    func=amp_mdp.disable_termination_at_step,
+    params={
+      "term_name": "left_foot_touched_ball",
+      "step": 3000 * 24,
+    },
+  )
+  # Narrow kick_direction_reward's tolerance (45deg -> 15deg) over iterations
+  # 2000-14000 -- was 2000-7000 -> 5deg, but that let the tolerance finish
+  # tightening well before the policy could reliably hit it, flipping
+  # kick_impact/kick_direction (both SIGNED, -1 to +1) from net-positive to
+  # net-negative right at iteration 7000 and collapsing the incentive to
+  # commit to a full kick (see git history/commit message for the log
+  # evidence). Longer runway + less extreme final tolerance this time.
+  # kick_impact's own dir_sigma is narrowed on the exact same schedule so the
+  # "wrong direction gets penalized" gate in both terms tightens together.
   cfg.curriculum["narrow_kick_direction"] = CurriculumTermCfg(
     func=amp_mdp.anneal_reward_param_linear,
     params={
       "reward_name": "kick_direction",
       "param_name": "sigma",
       "start_step": 2000 * 24,
-      "end_step": 7000 * 24,
+      "end_step": 14000 * 24,
       "start_value": KICK_DIR_SIGMA_START,
       "end_value": KICK_DIR_SIGMA_END,
     },
@@ -369,7 +445,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "reward_name": "kick_impact",
       "param_name": "dir_sigma",
       "start_step": 2000 * 24,
-      "end_step": 7000 * 24,
+      "end_step": 14000 * 24,
       "start_value": KICK_DIR_SIGMA_START,
       "end_value": KICK_DIR_SIGMA_END,
     },

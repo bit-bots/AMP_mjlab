@@ -11,14 +11,25 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 
-def object_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+def object_contact(
+  env: ManagerBasedRlEnv, sensor_name: str, enabled: bool = True
+) -> torch.Tensor:
   """Terminate an env the instant the named contact sensor registers a contact.
 
   Used for the kick task's left-foot/ball sensor: only the right foot may kick.
+
+  ``enabled``: if False, never terminates (returns all-False). Meant to be
+  flipped by a curriculum (``disable_termination_at_step``, mdp/curriculums.py)
+  mutating this term's own ``params["enabled"]`` at a target training step --
+  TerminationManager re-reads ``term_cfg.params`` fresh on every call, so this
+  works the same way reward-weight curricula mutate a reward term's params.
   """
   sensor: ContactSensor = env.scene[sensor_name]
   assert sensor.data.found is not None
-  return (sensor.data.found > 0).any(dim=-1)
+  touching = (sensor.data.found > 0).any(dim=-1)
+  if not enabled:
+    return torch.zeros_like(touching)
+  return touching
 
 
 class DelayedTerminationManager(TerminationManager):

@@ -335,6 +335,33 @@ def foot_slip_penalty(
   return torch.sum(vel_xy_norm_sq * in_contact, dim=1)
 
 
+def foot_short_air_time_penalty(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  min_air_time: float = 0.25,
+) -> torch.Tensor:
+  """Penalize a foot for landing after too short a swing (a shuffling gait),
+  in place of ``mjlab.tasks.velocity.mdp.feet_air_time``'s medium-range
+  reward -- this only fires on landing, and only for the deficit below
+  ``min_air_time``, not the full [min, max] band that reward used.
+
+  penalty = ``sum_over_feet(clamp(min_air_time - last_air_time, min=0))``,
+  evaluated the instant each foot lands (``ContactSensor.
+  compute_first_contact``) -- i.e. checked against the JUST-COMPLETED swing
+  duration, not the still-growing ``current_air_time`` mid-swing (which
+  would otherwise wrongly penalize the first ``min_air_time`` seconds of
+  every swing, including ones that turn out fine).
+
+  Requires the sensor to have ``track_air_time=True``.
+  """
+  sensor: ContactSensor = env.scene[sensor_name]
+  data = sensor.data
+  assert data.last_air_time is not None
+  first_contact = sensor.compute_first_contact(dt=env.step_dt)
+  shortfall = torch.clamp(min_air_time - data.last_air_time, min=0.0)
+  return torch.sum(shortfall * first_contact.float(), dim=1)
+
+
 def object_contact_reward(
   env: ManagerBasedRlEnv,
   sensor_name: str,

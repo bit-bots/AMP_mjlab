@@ -83,6 +83,28 @@ def anneal_reward_param_linear(
   return torch.tensor(value)
 
 
+def disable_termination_at_step(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  term_name: str,
+  step: int,
+) -> torch.Tensor:
+  """Hard step-change for a TERMINATION term (not a reward): once
+  ``env.common_step_counter`` passes ``step``, set the term's own
+  ``enabled=False`` param so it never fires again -- requires the
+  termination function to accept and honor an ``enabled`` kwarg (see
+  ``object_contact``, mdp/terminations.py). Mirrors
+  ``bump_reward_weight_at_step``, but TerminationManager (not RewardManager)
+  re-reads ``term_cfg.params`` fresh every ``compute()`` call, so mutating
+  the params dict here works the same way.
+  """
+  del env_ids
+  term_cfg = env.termination_manager.get_term_cfg(term_name)
+  if env.common_step_counter >= step:
+    term_cfg.params["enabled"] = False
+  return torch.tensor(float(term_cfg.params.get("enabled", True)))
+
+
 def bump_reward_weight_at_step(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,

@@ -172,6 +172,32 @@ def kick_dir_heading_b(
     return torch.stack([x_b, y_b], dim=-1)
 
 
+def kick_dir_heading_b_noisy(
+    env: ManagerBasedRlEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    std_rad: float = 0.0873,  # ~5deg
+) -> torch.Tensor:
+    """Actor-only noisy variant of ``kick_dir_heading_b``: Gaussian noise
+    added directly to the underlying yaw ANGLE, not the raw (x, y)
+    components -- component-wise additive noise on a unit vector (mjlab's
+    generic ``GaussianNoiseCfg`` pipeline, used for e.g. ``ball_pos_b``)
+    would corrupt the unit-norm representation, whereas perturbing the angle
+    and re-encoding as ``(cos, sin)`` models a noisy heading sensor while
+    keeping the output a proper unit vector regardless of noise magnitude.
+
+    Resampled every step (like mjlab's other per-step observation noise),
+    not a fixed per-episode bias.
+    """
+    robot: Entity = env.scene[robot_cfg.name]
+    kick_dir = getattr(env, "kick_dir_world", None)
+    if kick_dir is None:
+        return torch.zeros(env.num_envs, 2, device=env.device)
+    angle_w = torch.atan2(kick_dir[:, 1], kick_dir[:, 0])
+    angle_b = angle_w - robot.data.heading_w
+    angle_b = angle_b + torch.randn_like(angle_b) * std_rad
+    return torch.stack([torch.cos(angle_b), torch.sin(angle_b)], dim=-1)
+
+
 def kick_state_obs(
     env: ManagerBasedRlEnv, timer_attr: str = "kick_timer"
 ) -> torch.Tensor:

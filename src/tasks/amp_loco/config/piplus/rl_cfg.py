@@ -97,9 +97,10 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
   back to 0.2/0.75 (~20% style), amp_reward_coef lowered again to 0.15/0.75
   (~15% style), 0.2/0.9 (~8% style), 0.2/0.85 (~12% style), 0.2/0.8
   (~16% style), 0.2/0.7 (~24% style), 0.2/0.6 (~32% style), amp_reward_coef
-  lowered to 0.13/0.6 (~22% style) -- the policy still looked like it was
-  ignoring style at that point, so lerp is now lowered further to 0.13/0.45
-  (~40% style) to give the AMP term more relative pull.
+  lowered to 0.13/0.6 (~22% style), lerp lowered to 0.13/0.45 (~40% style),
+  now lerp lowered further to 0.13/0.35 (~48% style) -- applied from the
+  start of training (not a curriculum), unlike the torque/action-rate
+  penalty bump below.
   """
   base = piplus_amp_ppo_runner_cfg()
   # init_std=2.0 (was 1.0): a wider initial action-noise distribution for
@@ -115,6 +116,6 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
     wandb_project="piplus_amp_kick",
     amp_motion_files=os.path.normpath(os.path.join(_MOTION_DATA_DIR, "KickAndRun")),
     amp_reward_coef=0.13,
-    amp_task_reward_lerp=0.45,
+    amp_task_reward_lerp=0.35,
     save_interval=500,
   )
