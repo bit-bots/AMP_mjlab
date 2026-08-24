@@ -11,14 +11,18 @@ the retargeted CMU soccer-kick clips, src/assets/motions/piplus/amp/Kick/) alrea
 supplies a natural kicking-motion prior; the task reward only needs to steer WHERE
 and WHEN that motion fires:
   - move toward the ball instead of tracking a velocity command,
-  - reward for the right foot touching the ball, scaled up by the resulting ball
+  - reward for EITHER foot touching the ball (foot-agnostic -- ball-velocity-
+    based, not tied to a specific foot), scaled up by the resulting ball
     speed/height for a few seconds after contact (kick_impact_reward, windowed by
-    the kick_contact_cycle event), after which the ball resets nearby WITHOUT
-    ending the episode -- the whole ball lifecycle is contact-driven, not
-    distance-driven (no penalty/reset for the ball just being far away),
-  - a penalty when close to the ball if the right foot's inside (medial) edge
-    isn't facing it, to discourage toe-poke/front-of-foot contact,
-  - the left foot touching the ball ends the episode.
+    the kick_contact_cycle event, which also picks whichever foot was actually
+    closer to the ball to score contact quality), after which the ball resets
+    nearby WITHOUT ending the episode -- the whole ball lifecycle is
+    contact-driven, not distance-driven (no penalty/reset for the ball just
+    being far away),
+  - a penalty when close to the ball if either foot's inside (medial) edge
+    isn't facing it, to discourage toe-poke/front-of-foot contact with either
+    foot,
+  - no termination for kicking with the "wrong" foot -- there isn't one.
 """
 
 import copy
@@ -31,8 +35,8 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.tasks.velocity.mdp.rewards import feet_air_time
 from mjlab.utils.noise import GaussianNoiseCfg
 
 from src.assets.objects import get_ball_cfg
@@ -68,12 +72,25 @@ KICK_WINDOW_S = 1.0
 # Bumped from 0.5 so the foot starts turning to line up the medial edge earlier
 # in the approach, not just in the last half-meter.
 FOOT_ALIGNMENT_CLOSE_DIST = 0.9
-# move_to_ball/torso_orient_to_ball measure from a point 20cm to the robot's
-# right of the anchor (torso) instead of the anchor's own origin -- lines the
-# approach up around the kicking (right) foot's side rather than the body
-# center. -Y is the robot's right in the torso's local frame (matches
-# foot_medial_alignment's convention: r_ankle_roll_link sits on the -Y side).
-KICK_APPROACH_OFFSET_B = (0.0, -0.20, 0.0)
+# move_to_ball/torso_orient_to_ball measure from a point 20cm to the side of
+# the anchor (torso) instead of the anchor's own origin -- lines the approach
+# up around whichever foot select_kick_foot_is_left currently picks, rather
+# than the body center. -Y is the robot's right (matches
+# foot_medial_alignment's convention: r_ankle_roll_link sits on the -Y side),
+# so a right-foot selection gets a negative offset, a left-foot selection a
+# positive one -- recomputed every step from the CURRENT ball position and
+# target kick angle, not a fixed side.
+KICK_APPROACH_OFFSET_MAGNITUDE = 0.20
+# select_kick_foot_is_left's hard decision boundary (mdp/rewards.py): within
+# this many degrees of straight ahead, pick the foot on the ball's own side;
+# beyond it, pick by kick angle alone (a left-angled kick needs the right
+# foot to swing across the body, a right-angled kick needs the left foot).
+# Interactively tuned/validated as a hard rule, not a blend -- see the kick
+# foot selector debug tool. Shared by the approach offset above,
+# kick_contact_cycle's foot-correctness gating, and ball_kick_contact's
+# reward/penalty, so all three agree on which foot is "correct" at any
+# given moment.
+KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG = 20.0
 # kick_direction_reward/kick_impact_reward's angular tolerance (Gaussian
 # sigma, radians), narrowed over training via a curriculum -- see
 # anneal_reward_param_linear below. Was 45deg -> 5deg over iterations
@@ -95,6 +112,9 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.scene.entities[BALL_NAME] = get_ball_cfg()
 
   # --- Per-foot ball contact sensors ---------------------------------------
+  # Used only by cross_foot_touch_penalty below (which foot touched the ball
+  # first each life) -- NOT for a foot-restriction termination, there isn't
+  # one anymore.
   r_foot_ball_cfg = ContactSensorCfg(
     name="r_foot_ball_contact",
     primary=ContactMatch(mode="subtree", pattern=RIGHT_FOOT_SUBTREE, entity="robot"),
@@ -192,7 +212,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
-      "offset_b": KICK_APPROACH_OFFSET_B,
+      "adaptive_foot_offset": KICK_APPROACH_OFFSET_MAGNITUDE,
+      "foot_select_angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
       "alignment_power": 3.0,
     },
   )
@@ -220,7 +241,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
-      "offset_b": KICK_APPROACH_OFFSET_B,
+      "adaptive_foot_offset": KICK_APPROACH_OFFSET_MAGNITUDE,
+      "foot_select_angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
     },
   )
   # Small penalty for foot sliding while grounded. mdp.feet_slip (mjlab base,
@@ -234,14 +256,15 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "asset_cfg": SceneEntityCfg("robot", site_names=SITE_NAMES),
     },
   )
-  # Penalty (not mjlab's medium-range +1 reward) for a foot landing after too
-  # short a swing -- discourages a shuffling gait without also rewarding an
-  # exaggeratedly high-stepping one the way the mjlab version would. Bumped
-  # from -1.0 -- too weak to noticeably discourage shuffling.
+  # Back to mjlab's standard velocity-task gait reward (was briefly a
+  # short-air-time-only penalty): +1 per foot whose current swing (air time)
+  # falls in a MEDIUM range (0.05s-0.5s, mjlab's own defaults), no
+  # command_name (the kick task has none, matching foot_slip above). Bumped
+  # from 1.0.
   cfg.rewards["foot_air_time"] = RewardTermCfg(
-    func=amp_mdp.foot_short_air_time_penalty,
-    weight=-3.0,
-    params={"sensor_name": "feet_ground_contact", "min_air_time": 0.25},
+    func=feet_air_time,
+    weight=2.5,
+    params={"sensor_name": "feet_ground_contact"},
   )
   # Tiny torque penalty (not present anywhere in the kick task's reward set
   # before this): mdp.joint_torques_l2 is mjlab's built-in L2 actuator-force
@@ -251,26 +274,30 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     func=amp_mdp.joint_torques_l2,
     weight=-1.0e-5,
   )
-  # right_foot_ball_contact/kick_impact bumped ~40x (2.0->80.0, 1.0->40.0): even
+  # ball_kick_contact/kick_impact bumped ~40x (2.0->80.0, 1.0->40.0): even
   # with AMP back at its original weight, the policy still converged to standing
   # still -- track_root_height/body_ang_vel_xy_l2 already reward a stable stance,
   # and is_terminated=-200 makes any fall-risking approach-and-kick attempt look
   # very unattractive in expectation, so the ball-contact/impact incentives need
   # to be large enough to actually outweigh that safe local optimum.
   #
-  # first_ball_kick_reward (not object_contact_reward, not
+  # ball_kick_contact_reward (not object_contact_reward, not
   # first_object_contact_reward): the continuous per-step version paid out
   # for every step of contact, so the policy learned to just rest the foot on
   # the ball instead of kicking it -- one-shot per ball "life" removes that
-  # exploit. Ball-velocity-based (not the r_foot_ball_contact sensor): a fast
-  # kick can make contact and separate again within a single RL step's
-  # physics substeps, which the sensor (sampled once per RL step) can
-  # silently miss even though the kick was genuine -- confirmed empirically,
-  # see first_ball_kick_reward's docstring (mdp/rewards.py).
-  cfg.rewards["right_foot_ball_contact"] = RewardTermCfg(
-    func=amp_mdp.first_ball_kick_reward,
+  # exploit. Sourced from kick_contact_cycle's ball-velocity-based contact
+  # detection (not a foot/ball contact sensor: a fast kick can make contact
+  # and separate again within a single RL step's physics substeps, which a
+  # sensor sampled once per RL step can silently miss even though the kick
+  # was genuine -- confirmed empirically, see kick_contact_cycle's
+  # docstring). Foot-gated: full reward only if the foot that actually struck
+  # the ball was the one select_kick_foot_is_left says should have been used
+  # (given the ball's position/target angle at that moment); a 50% penalty
+  # (wrong_foot_penalty) if the other foot struck it instead.
+  cfg.rewards["ball_kick_contact"] = RewardTermCfg(
+    func=amp_mdp.ball_kick_contact_reward,
     weight=80.0,
-    params={"ball_cfg": SceneEntityCfg(BALL_NAME)},
+    params={"wrong_foot_penalty": 0.5},
   )
   # weight=10.0 (bumped 5x from 2.0): kick_impact's raw speed+height term is
   # tanh-saturated to [0, 1) (see rewards.py), so this weight IS the max
@@ -306,8 +333,11 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Bumped (was -0.2): a proper side-foot kick now pays off twice over --
   # avoiding this penalty AND collecting the full kick_impact style multiplier
   # above -- while front/back or outside contact are hit by both this penalty
-  # AND a heavily discounted (or zero) kick_impact.
-  cfg.rewards["foot_ball_alignment"] = RewardTermCfg(
+  # AND a heavily discounted (or zero) kick_impact. Extended to both feet
+  # independently (was right-foot only) -- kicking is no longer restricted
+  # to one foot, so misalignment should be checked/penalized for whichever
+  # foot is actually close to the ball, not just the right one.
+  cfg.rewards["foot_ball_alignment_right"] = RewardTermCfg(
     func=amp_mdp.foot_medial_alignment_penalty,
     weight=-0.5,
     params={
@@ -317,15 +347,27 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "close_dist": FOOT_ALIGNMENT_CLOSE_DIST,
     },
   )
-
-  # --- Left-foot/ball contact ends the episode -----------------------------
-  # (Touching the ball before being positioned/aligned used to also end the
-  # episode via a "premature touch" termination -- removed along with the
-  # approach-point state machine it depended on; the robot may now kick the
-  # ball at any time, so there's no "too early" to penalize.)
-  cfg.terminations["left_foot_touched_ball"] = TerminationTermCfg(
-    func=amp_mdp.object_contact,
-    params={"sensor_name": "l_foot_ball_contact"},
+  cfg.rewards["foot_ball_alignment_left"] = RewardTermCfg(
+    func=amp_mdp.foot_medial_alignment_penalty,
+    weight=-0.5,
+    params={
+      "ball_cfg": SceneEntityCfg(BALL_NAME),
+      "foot_cfg": SceneEntityCfg("robot", body_names=(LEFT_FOOT_SUBTREE,)),
+      "medial_sign": -1.0,  # -Y is medial for the left foot (see rewards.py docstring).
+      "close_dist": FOOT_ALIGNMENT_CLOSE_DIST,
+    },
+  )
+  # Discourage double-touching the ball with both feet: once one foot has
+  # touched it first (this ball "life"), the other foot subsequently also
+  # touching is penalized -- kicking should be a single clean strike with
+  # one foot, not both feet fumbling at it.
+  cfg.rewards["cross_foot_touch"] = RewardTermCfg(
+    func=amp_mdp.cross_foot_touch_penalty,
+    weight=-30.0,
+    params={
+      "right_sensor_name": "r_foot_ball_contact",
+      "left_sensor_name": "l_foot_ball_contact",
+    },
   )
 
   # --- Ball spawn (reset) + contact-driven reward window/reset (every step) --
@@ -346,12 +388,18 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "robot_cfg": SceneEntityCfg("robot"),
       "ball_cfg": SceneEntityCfg(BALL_NAME),
-      "foot_body_name": RIGHT_FOOT_SUBTREE,
-      "medial_sign": 1.0,  # +Y is medial for the right foot (see rewards.py docstring).
+      # Both feet, foot-agnostic: at the moment of a kick, style (contact
+      # quality) is scored using whichever of these two is actually closer
+      # to the ball, not always the right foot -- see kick_contact_cycle's
+      # docstring (mdp/events.py).
+      "foot_body_names": (RIGHT_FOOT_SUBTREE, LEFT_FOOT_SUBTREE),
+      "medial_signs": (1.0, -1.0),  # +Y medial for right, -Y medial for left (see rewards.py docstring).
       "window_s": KICK_WINDOW_S,
       "dist_range": BALL_DIST_RANGE,
       "lateral_range": BALL_LATERAL_RANGE,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
+      "anchor_body_name": ANCHOR_NAME,
+      "angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
     },
   )
 
@@ -394,29 +442,17 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "scale": 4.0,
     },
   )
-  # Completely drop right_foot_ball_contact's one-shot reward at iteration
-  # 2000 -- it exists purely to bootstrap discovering ball contact at all;
-  # once that's established this early, kick_impact/kick_direction (which
-  # score contact QUALITY, not just its occurrence) should drive the rest
-  # without a flat +80 one-off still on offer.
-  cfg.curriculum["drop_right_foot_ball_contact"] = CurriculumTermCfg(
+  # Completely drop ball_kick_contact's one-shot reward at iteration 2000 --
+  # it exists purely to bootstrap discovering ball contact at all; once
+  # that's established this early, kick_impact/kick_direction (which score
+  # contact QUALITY, not just its occurrence) should drive the rest without
+  # a flat +80 one-off still on offer.
+  cfg.curriculum["drop_ball_kick_contact"] = CurriculumTermCfg(
     func=amp_mdp.bump_reward_weight_at_step,
     params={
-      "reward_names": ["right_foot_ball_contact"],
+      "reward_names": ["ball_kick_contact"],
       "step": 2000 * 24,
       "scale": 0.0,
-    },
-  )
-  # Disable the left-foot/ball-contact termination at iteration 3000 -- it
-  # exists to steer the policy away from kicking with the wrong foot early
-  # on; once that's established, dropping it removes a fall-risk source
-  # (episode-ending on any left-foot brush) that's no longer needed to teach
-  # the distinction.
-  cfg.curriculum["drop_left_foot_termination"] = CurriculumTermCfg(
-    func=amp_mdp.disable_termination_at_step,
-    params={
-      "term_name": "left_foot_touched_ball",
-      "step": 3000 * 24,
     },
   )
   # Narrow kick_direction_reward's tolerance (45deg -> 15deg) over iterations

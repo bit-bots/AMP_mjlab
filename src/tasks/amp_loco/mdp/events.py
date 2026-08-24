@@ -7,14 +7,18 @@ import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.utils.lab_api.math import sample_uniform
+from mjlab.utils.lab_api.math import sample_uniform, subtract_frame_transforms
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
 
 from src.assets.objects import BALL_RADIUS
 from src.tasks.amp_loco.ampmotion_loader import MotionLoader
-from src.tasks.amp_loco.mdp.rewards import foot_medial_alignment
+from src.tasks.amp_loco.mdp.rewards import (
+    foot_medial_alignment,
+    local_kick_dir_xy,
+    select_kick_foot_is_left,
+)
 from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
@@ -348,6 +352,10 @@ def _place_ball_near_robot(
     # first_object_contact_reward's contact_reward_claimed (mdp/rewards.py).
     if hasattr(env, "contact_reward_claimed"):
         env.contact_reward_claimed[env_ids] = False
+    # ...and cross_foot_touch_penalty's first-toucher claim (mdp/rewards.py):
+    # a fresh ball life means neither foot has touched it yet.
+    if hasattr(env, "ball_first_touch_foot"):
+        env.ball_first_touch_foot[env_ids] = -1
     # ...and a fresh target kick direction (kick_direction_reward, mdp/rewards.py),
     # sampled relative to the robot's heading at THIS reposition (not its
     # heading at some later point), so it stays a plausible target.
@@ -394,11 +402,11 @@ class kick_contact_cycle:
     """Contact-driven ball cycle: kicking -> post-kick -> kicking.
 
     **kicking** (``env.kick_timer`` == 0). The robot may strike the ball at
-    any time -- there's no separate "positioned/aligned" gate before contact
-    counts. Getting the robot to actually walk up and line up a good strike
-    is left entirely to the ordinary rewards (``move_toward_object``,
-    ``torso_orient_to_object``, ``foot_medial_alignment_penalty``), not a
-    state machine here.
+    any time, with EITHER foot -- there's no separate "positioned/aligned"
+    gate before contact counts, and no foot restriction. Getting the robot
+    to actually walk up and line up a good strike is left entirely to the
+    ordinary rewards (``move_toward_object``, ``torso_orient_to_object``,
+    ``foot_medial_alignment_penalty``), not a state machine here.
 
     **post-kick** (``env.kick_timer`` > 0). Entered once the ball's speed
     exceeds ``impact_speed_threshold`` while kicking; holds for ``window_s``
@@ -408,27 +416,48 @@ class kick_contact_cycle:
     the cycle returns to kicking.
 
     ``env.kick_timer`` (steps remaining in the post-kick window) and
-    ``env.kick_style`` (the foot/ball alignment quality at the moment of
-    contact, in [0, 1], frozen for the whole window) are shared with
+    ``env.kick_style`` (the CLOSER foot's ball alignment quality at the
+    moment of contact, in [0, 1], frozen for the whole window -- foot-
+    agnostic: whichever of the configured feet is nearer the ball when the
+    kick is detected is used, not always a fixed one) are shared with
     ``kick_impact_reward`` (mdp/rewards.py), which reads them to gate/scale
-    the ball speed+height reward; this event owns writing both. Use with
-    ``mode="step"``.
+    the ball speed+height reward; this event owns writing both.
+
+    Also computes, at the same moment: ``env.kick_new_contact`` (a
+    transient, this-event-round-only flag -- overwritten every call, not
+    held) and ``env.kick_foot_correct`` (frozen for the window like
+    ``kick_style``) -- whether the foot that actually struck the ball (the
+    same "closest configured foot" used for ``kick_style``) matches the
+    foot ``select_kick_foot_is_left`` (mdp/rewards.py) says should have been
+    used, given the ball's position and target kick angle AT THE MOMENT of
+    contact. ``ball_kick_contact_reward`` and ``kick_impact_reward``
+    (mdp/rewards.py) read these to reward/penalize by foot correctness. Use
+    with ``mode="step"``.
     """
 
     def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
         self._env = env
         self._robot: Entity = env.scene[cfg.params["robot_cfg"].name]
         self._ball: Entity = env.scene[cfg.params["ball_cfg"].name]
-        self._foot_body_id = self._robot.find_bodies(cfg.params["foot_body_name"])[0][0]
-        self._medial_sign = cfg.params.get("medial_sign", 1.0)
+        foot_body_names = cfg.params["foot_body_names"]
+        self._foot_body_ids = [self._robot.find_bodies(n)[0][0] for n in foot_body_names]
+        self._foot_is_left = torch.tensor(
+            [n.startswith("l_") for n in foot_body_names], device=env.device
+        )
+        self._medial_signs = list(cfg.params.get("medial_signs", (1.0,) * len(foot_body_names)))
         self._impact_speed_threshold = cfg.params.get("impact_speed_threshold", 0.2)
         window_s = cfg.params.get("window_s", 2.0)
         self._window_steps = max(1, round(window_s / env.step_dt))
         self._dist_range = cfg.params.get("dist_range", (0.3, 1.0))
         self._lateral_range = cfg.params.get("lateral_range", (0.2, 0.7))
         self._kick_dir_cone_deg = cfg.params.get("kick_dir_cone_deg", 80.0)
+        anchor_body_name = cfg.params.get("anchor_body_name", "torso_link")
+        self._anchor_body_id = self._robot.find_bodies(anchor_body_name)[0][0]
+        self._angle_threshold_deg = cfg.params.get("angle_threshold_deg", 20.0)
         env.kick_timer = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         env.kick_style = torch.zeros(env.num_envs, device=env.device)
+        env.kick_new_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env.kick_foot_correct = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env.kick_dir_world = _sample_kick_dir(env.num_envs, env.device)
 
     def reset(self, env_ids) -> None:
@@ -465,17 +494,20 @@ class kick_contact_cycle:
         env_ids: torch.Tensor | None,
         robot_cfg: SceneEntityCfg,
         ball_cfg: SceneEntityCfg,
-        foot_body_name: str,
-        medial_sign: float = 1.0,
+        foot_body_names: tuple[str, ...],
+        medial_signs: tuple[float, ...] = (1.0,),
         impact_speed_threshold: float = 0.2,
         window_s: float = 2.0,
         dist_range: tuple[float, float] = (0.3, 1.0),
         lateral_range: tuple[float, float] = (0.2, 0.7),
         kick_dir_cone_deg: float = 80.0,
+        anchor_body_name: str = "torso_link",
+        angle_threshold_deg: float = 20.0,
     ) -> None:
         del (
-            env_ids, robot_cfg, ball_cfg, foot_body_name, medial_sign,
+            env_ids, robot_cfg, ball_cfg, foot_body_names, medial_signs,
             impact_speed_threshold, window_s, dist_range, lateral_range, kick_dir_cone_deg,
+            anchor_body_name, angle_threshold_deg,
         )
         # All params unused here; resolved once in __init__.
 
@@ -486,27 +518,57 @@ class kick_contact_cycle:
         # struck -- confirmed empirically (ball visibly moves, sensor never
         # shows touching that step). Ball velocity is an integrated physics
         # state that persists past the moment of contact, so it doesn't have
-        # this blind spot. See first_ball_kick_reward (mdp/rewards.py), which
+        # this blind spot. See ball_kick_contact_reward (mdp/rewards.py), which
         # uses the same signal.
         ball_speed = torch.norm(self._ball.data.root_link_lin_vel_w[:, :2], dim=-1)
         kicked = ball_speed > self._impact_speed_threshold
 
         idle = env.kick_timer == 0
         new_contact = kicked & idle
+        env.kick_new_contact = new_contact
         env.kick_timer = torch.where(
             new_contact, torch.full_like(env.kick_timer, self._window_steps), env.kick_timer
         )
 
         if new_contact.any():
-            foot_pos = self._robot.data.body_link_pos_w[:, self._foot_body_id, :2]
-            foot_quat = self._robot.data.body_link_quat_w[:, self._foot_body_id]
+            # Foot-agnostic: score contact quality using whichever configured
+            # foot is actually CLOSER to the ball right now, not a fixed one
+            # -- so a kick with either foot gets its own alignment scored
+            # correctly instead of always being judged against one foot's
+            # (possibly irrelevant) position/orientation.
             ball_pos = self._ball.data.root_link_pos_w[:, :2]
-            align = foot_medial_alignment(foot_pos, foot_quat, ball_pos, self._medial_sign)
+            dists, aligns = [], []
+            for foot_id, sign in zip(self._foot_body_ids, self._medial_signs):
+                foot_pos = self._robot.data.body_link_pos_w[:, foot_id, :2]
+                foot_quat = self._robot.data.body_link_quat_w[:, foot_id]
+                dists.append(torch.norm(ball_pos - foot_pos, dim=-1))
+                aligns.append(foot_medial_alignment(foot_pos, foot_quat, ball_pos, sign))
+            closest = torch.argmin(torch.stack(dists, dim=-1), dim=-1, keepdim=True)
+            align = torch.gather(torch.stack(aligns, dim=-1), 1, closest).squeeze(-1)
             # Squared clip-to-[0,1], mirroring mjxperiment's kick_style: only
             # alignment close to perfectly medial earns close to full credit, so
             # a proper side-foot kick pays much more than a glancing one.
             style = torch.clamp(align, 0.0, 1.0) ** 2
             env.kick_style = torch.where(new_contact, style, env.kick_style)
+
+            # Foot correctness: which foot ACTUALLY struck the ball (the same
+            # "closest configured foot" used for style, above) vs. which foot
+            # select_kick_foot_is_left says SHOULD have, given the ball's
+            # position and target kick angle in the robot's local frame at
+            # this exact moment -- not a static/pre-approach decision.
+            actual_is_left = self._foot_is_left[closest.squeeze(-1)]
+            anchor_pos_w = self._robot.data.body_link_pos_w[:, self._anchor_body_id]
+            anchor_quat_w = self._robot.data.body_link_quat_w[:, self._anchor_body_id]
+            ball_pos_b, _ = subtract_frame_transforms(
+                anchor_pos_w, anchor_quat_w, self._ball.data.root_link_pos_w
+            )
+            kick_dir_b = local_kick_dir_xy(env, self._robot)
+            desired_is_left = select_kick_foot_is_left(
+                ball_pos_b[:, :2], kick_dir_b, self._angle_threshold_deg
+            )
+            env.kick_foot_correct = torch.where(
+                new_contact, actual_is_left == desired_is_left, env.kick_foot_correct
+            )
 
         expiring = env.kick_timer == 1  # last active step of the window
         env.kick_timer = torch.clamp(env.kick_timer - 1, min=0)

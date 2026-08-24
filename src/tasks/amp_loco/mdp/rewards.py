@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -228,16 +229,98 @@ def soft_landing(
   return cost
 
 def _offset_anchor_pos_w(
-  robot: Entity, anchor_cfg: SceneEntityCfg, offset_b: tuple[float, float, float]
+  robot: Entity,
+  anchor_cfg: SceneEntityCfg,
+  offset_b: tuple[float, float, float] | torch.Tensor,
 ) -> torch.Tensor:
   """Anchor body position, shifted by a local-frame offset (e.g. off-center
-  toward the kicking foot instead of the body origin)."""
+  toward the kicking foot instead of the body origin). ``offset_b`` is either
+  a static (x, y, z) tuple shared by all envs, or a per-env ``(N, 3)`` tensor
+  (e.g. from ``_adaptive_foot_offset_b``)."""
   pos_w = robot.data.body_link_pos_w[:, anchor_cfg.body_ids[0]]
-  if offset_b == (0.0, 0.0, 0.0):
-    return pos_w
   quat_w = robot.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
-  offset = torch.tensor(offset_b, device=pos_w.device, dtype=pos_w.dtype)
-  return pos_w + quat_apply(quat_w, offset.expand(pos_w.shape[0], 3))
+  if isinstance(offset_b, torch.Tensor):
+    offset = offset_b
+  else:
+    if offset_b == (0.0, 0.0, 0.0):
+      return pos_w
+    offset = torch.tensor(offset_b, device=pos_w.device, dtype=pos_w.dtype).expand(
+      pos_w.shape[0], 3
+    )
+  return pos_w + quat_apply(quat_w, offset)
+
+
+def local_kick_dir_xy(env: ManagerBasedRlEnv, robot: Entity) -> torch.Tensor:
+  """Target kick direction (``env.kick_dir_world``) in the robot's local yaw
+  frame -- x forward, y left. Duplicates ``kick_dir_heading_b``'s math
+  (mdp/observations.py) rather than importing it, to avoid a rewards<->
+  observations import cycle; keep the two in sync if either changes."""
+  kick_dir = getattr(env, "kick_dir_world", None)
+  if kick_dir is None:
+    n = robot.data.root_link_pos_w.shape[0]
+    return torch.zeros(n, 2, device=robot.data.root_link_pos_w.device)
+  kick_dir = kick_dir / (torch.norm(kick_dir, dim=-1, keepdim=True) + 1e-6)
+  yaw = robot.data.heading_w
+  cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+  x_b = cos_yaw * kick_dir[:, 0] + sin_yaw * kick_dir[:, 1]
+  y_b = -sin_yaw * kick_dir[:, 0] + cos_yaw * kick_dir[:, 1]
+  return torch.stack([x_b, y_b], dim=-1)
+
+
+def select_kick_foot_is_left(
+  ball_pos_b_xy: torch.Tensor,
+  kick_dir_b_xy: torch.Tensor,
+  angle_threshold_deg: float = 20.0,
+) -> torch.Tensor:
+  """Hard decision for which foot SHOULD strike the ball, given the ball's
+  current position and the target kick angle, both in the robot's local
+  (base-heading) frame -- x forward, y left, matching ``local_kick_dir_xy``/
+  ``kick_dir_heading_b``'s convention.
+
+  Within ``angle_threshold_deg`` of straight ahead, go by which side the
+  ball is actually on (a roughly-forward kick uses whichever foot is
+  nearer). Beyond that, go by the angle alone: a kick angled left needs the
+  RIGHT foot to swing across the body, one angled right needs the LEFT foot
+  -- regardless of which side the ball is on. No blending between the two
+  regimes -- interactively tuned and validated as a hard rule, see the kick
+  foot selector debug tool.
+  """
+  angle = torch.atan2(kick_dir_b_xy[:, 1], kick_dir_b_xy[:, 0])
+  threshold = math.radians(angle_threshold_deg)
+  in_band = torch.abs(angle) <= threshold
+  by_position = ball_pos_b_xy[:, 1] >= 0.0
+  by_angle = angle < 0.0
+  return torch.where(in_band, by_position, by_angle)
+
+
+def _adaptive_foot_offset_b(
+  env: ManagerBasedRlEnv,
+  robot: Entity,
+  anchor_cfg: SceneEntityCfg,
+  obj_pos_w: torch.Tensor,
+  magnitude: float,
+  angle_threshold_deg: float = 20.0,
+) -> torch.Tensor:
+  """Per-env local-frame (x, y, z) offset toward whichever foot the current
+  ``select_kick_foot_is_left`` decision picks: local -Y (the robot's right,
+  see ``foot_medial_alignment``'s convention) for a right-foot selection,
+  local +Y (the left) for a left-foot selection -- re-evaluated every step
+  from the CURRENT ball position and target kick angle, so the approach
+  target always tracks the foot the robot is actually meant to kick with,
+  instead of just the ball's raw side."""
+  anchor_pos_w = robot.data.body_link_pos_w[:, anchor_cfg.body_ids[0]]
+  anchor_quat_w = robot.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
+  obj_pos_b, _ = subtract_frame_transforms(anchor_pos_w, anchor_quat_w, obj_pos_w)
+  kick_dir_b = local_kick_dir_xy(env, robot)
+  is_left = select_kick_foot_is_left(obj_pos_b[:, :2], kick_dir_b, angle_threshold_deg)
+  side_sign = torch.where(
+    is_left,
+    torch.ones_like(obj_pos_b[:, 1]),
+    -torch.ones_like(obj_pos_b[:, 1]),
+  )
+  offset_y = side_sign * magnitude
+  zeros = torch.zeros_like(offset_y)
+  return torch.stack([zeros, offset_y, zeros], dim=-1)
 
 
 def move_toward_object(
@@ -246,6 +329,8 @@ def move_toward_object(
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
   offset_b: tuple[float, float, float] = (0.0, 0.0, 0.0),
   alignment_power: float = 1.0,
+  adaptive_foot_offset: float | None = None,
+  foot_select_angle_threshold_deg: float = 20.0,
 ) -> torch.Tensor:
   """World-frame, heading-independent reward for the anchor's speed toward a
   free-body object.
@@ -272,12 +357,25 @@ def move_toward_object(
 
   ``offset_b``: local-frame offset from the anchor body's origin (e.g. toward
   the kicking foot rather than the torso center), used for the tracked
-  position only.
+  position only. Ignored if ``adaptive_foot_offset`` is set.
+
+  ``adaptive_foot_offset``: if set, overrides ``offset_b`` with a per-env
+  offset of this magnitude toward whichever foot ``select_kick_foot_is_left``
+  currently picks (see ``_adaptive_foot_offset_b``), so the approach target
+  follows the selected foot instead of always favoring one.
   """
   robot: Entity = env.scene[anchor_cfg.name]
   obj: Entity = env.scene[object_cfg.name]
 
-  anchor_pos = _offset_anchor_pos_w(robot, anchor_cfg, offset_b)[:, :2]
+  offset = (
+    _adaptive_foot_offset_b(
+      env, robot, anchor_cfg, obj.data.root_link_pos_w, adaptive_foot_offset,
+      foot_select_angle_threshold_deg,
+    )
+    if adaptive_foot_offset is not None
+    else offset_b
+  )
+  anchor_pos = _offset_anchor_pos_w(robot, anchor_cfg, offset)[:, :2]
   anchor_vel = robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2]
   to_obj = obj.data.root_link_pos_w[:, :2] - anchor_pos
   direction = to_obj / (torch.norm(to_obj, dim=-1, keepdim=True) + 1e-6)
@@ -292,6 +390,8 @@ def torso_orient_to_object(
   object_cfg: SceneEntityCfg,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
   offset_b: tuple[float, float, float] = (0.0, 0.0, 0.0),
+  adaptive_foot_offset: float | None = None,
+  foot_select_angle_threshold_deg: float = 20.0,
 ) -> torch.Tensor:
   """Reward the anchor body's forward direction pointing at a free-body object.
 
@@ -301,11 +401,21 @@ def torso_orient_to_object(
 
   ``offset_b``: see ``move_toward_object`` -- shifts which point's-eye-view the
   angle is computed from, without changing the anchor's own orientation axes.
+  Ignored if ``adaptive_foot_offset`` is set; see ``move_toward_object`` for
+  what that does.
   """
   robot: Entity = env.scene[anchor_cfg.name]
   obj: Entity = env.scene[object_cfg.name]
 
-  anchor_pos_w = _offset_anchor_pos_w(robot, anchor_cfg, offset_b)
+  offset = (
+    _adaptive_foot_offset_b(
+      env, robot, anchor_cfg, obj.data.root_link_pos_w, adaptive_foot_offset,
+      foot_select_angle_threshold_deg,
+    )
+    if adaptive_foot_offset is not None
+    else offset_b
+  )
+  anchor_pos_w = _offset_anchor_pos_w(robot, anchor_cfg, offset)
   anchor_quat_w = robot.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
   pos_b, _ = subtract_frame_transforms(
     anchor_pos_w, anchor_quat_w, obj.data.root_link_pos_w, obj.data.root_link_quat_w
@@ -333,33 +443,6 @@ def foot_slip_penalty(
   foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]
   vel_xy_norm_sq = torch.sum(torch.square(foot_vel_xy), dim=-1)
   return torch.sum(vel_xy_norm_sq * in_contact, dim=1)
-
-
-def foot_short_air_time_penalty(
-  env: ManagerBasedRlEnv,
-  sensor_name: str,
-  min_air_time: float = 0.25,
-) -> torch.Tensor:
-  """Penalize a foot for landing after too short a swing (a shuffling gait),
-  in place of ``mjlab.tasks.velocity.mdp.feet_air_time``'s medium-range
-  reward -- this only fires on landing, and only for the deficit below
-  ``min_air_time``, not the full [min, max] band that reward used.
-
-  penalty = ``sum_over_feet(clamp(min_air_time - last_air_time, min=0))``,
-  evaluated the instant each foot lands (``ContactSensor.
-  compute_first_contact``) -- i.e. checked against the JUST-COMPLETED swing
-  duration, not the still-growing ``current_air_time`` mid-swing (which
-  would otherwise wrongly penalize the first ``min_air_time`` seconds of
-  every swing, including ones that turn out fine).
-
-  Requires the sensor to have ``track_air_time=True``.
-  """
-  sensor: ContactSensor = env.scene[sensor_name]
-  data = sensor.data
-  assert data.last_air_time is not None
-  first_contact = sensor.compute_first_contact(dt=env.step_dt)
-  shortfall = torch.clamp(min_air_time - data.last_air_time, min=0.0)
-  return torch.sum(shortfall * first_contact.float(), dim=1)
 
 
 def object_contact_reward(
@@ -409,44 +492,80 @@ def first_object_contact_reward(
   return new_touch.float()
 
 
-def first_ball_kick_reward(
+def ball_kick_contact_reward(
   env: ManagerBasedRlEnv,
-  ball_cfg: SceneEntityCfg,
-  speed_threshold: float = 0.2,
-  state_attr: str = "contact_reward_claimed",
-  ready_attr: str | None = None,
+  wrong_foot_penalty: float = 0.5,
 ) -> torch.Tensor:
-  """One-shot reward the first step the ball's speed exceeds
-  ``speed_threshold`` (i.e. it was struck), not again until the ball is
-  repositioned.
+  """One-shot reward the step a kick is detected, foot-gated: full reward
+  (+1) if the foot that actually struck the ball was the one
+  ``select_kick_foot_is_left`` says should have been used, a penalty
+  (``-wrong_foot_penalty``) if the other foot struck it instead. Not paid
+  again until the ball is repositioned.
 
-  Uses ball velocity instead of a foot/ball contact sensor: a fast strike
-  can separate within a single RL step's physics substeps, which a contact
-  sensor (sampled once per RL step) can silently miss even though the kick
-  was genuine. Ball velocity persists past the moment of contact, so a real
-  kick is never missed here regardless of how quickly it separates.
-
-  Same one-shot-per-life semantics as ``first_object_contact_reward``: the
-  claim flag (``state_attr`` on ``env``) is cleared by
-  ``_place_ball_near_robot`` (mdp/events.py) whenever the ball's position is
-  reset, so a fresh kick after the next reset earns the reward again.
-
-  ``ready_attr`` is an optional extra gate, see ``first_object_contact_reward``;
-  unused by the kick task.
+  Sourced entirely from ``kick_contact_cycle`` (mdp/events.py), which is the
+  single authority on "did a kick just happen" (via ball velocity, not a
+  foot/ball contact sensor -- a fast strike can separate within one RL
+  step's physics substeps, which a contact sensor sampled once per step can
+  miss) and "which foot actually did it" (whichever configured foot was
+  closest to the ball at that moment). ``env.kick_new_contact`` is a
+  transient this-event-round flag (overwritten every step, not held) and
+  ``env.kick_foot_correct`` is frozen for the whole post-kick window --
+  this function only reads them, it holds no state of its own.
   """
-  claimed = getattr(env, state_attr, None)
-  if claimed is None:
-    claimed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-  ball: Entity = env.scene[ball_cfg.name]
-  ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
-  kicked = ball_speed > speed_threshold
-  if ready_attr is not None:
-    ready = getattr(env, ready_attr, None)
-    if ready is not None:
-      kicked = kicked & ready
-  new_kick = kicked & ~claimed
-  setattr(env, state_attr, claimed | kicked)
-  return new_kick.float()
+  new_contact = getattr(env, "kick_new_contact", None)
+  if new_contact is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  foot_correct = getattr(env, "kick_foot_correct", None)
+  if foot_correct is None:
+    foot_correct = torch.ones_like(new_contact)
+  reward = torch.where(
+    foot_correct,
+    torch.ones_like(new_contact, dtype=torch.float32),
+    torch.full_like(new_contact, -wrong_foot_penalty, dtype=torch.float32),
+  )
+  return torch.where(new_contact, reward, torch.zeros_like(reward))
+
+
+def cross_foot_touch_penalty(
+  env: ManagerBasedRlEnv,
+  right_sensor_name: str,
+  left_sensor_name: str,
+  state_attr: str = "ball_first_touch_foot",
+) -> torch.Tensor:
+  """Penalize a foot touching the ball after the OTHER foot already touched
+  it first, for the same ball "life" -- encourages a single clean strike
+  with one foot rather than both feet fumbling/scrambling at the ball.
+
+  ``state_attr`` (int8 on ``env``: -1 = no foot has touched yet this life,
+  0 = right touched first, 1 = left touched first) is cleared by
+  ``_place_ball_near_robot`` (mdp/events.py) whenever the ball is
+  repositioned (episode reset or post-kick respawn), so a fresh ball life
+  starts unclaimed again.
+
+  If both feet are already touching on the very step the first touch is
+  recorded, "which one was first" is ambiguous, so neither is blamed that
+  step -- the penalty only targets the OTHER foot showing up after a first
+  toucher has already been established.
+  """
+  right: ContactSensor = env.scene[right_sensor_name]
+  left: ContactSensor = env.scene[left_sensor_name]
+  assert right.data.found is not None and left.data.found is not None
+  right_touch = (right.data.found > 0).any(dim=-1)
+  left_touch = (left.data.found > 0).any(dim=-1)
+
+  first_foot = getattr(env, state_attr, None)
+  if first_foot is None:
+    first_foot = torch.full((env.num_envs,), -1, dtype=torch.int8, device=env.device)
+
+  unclaimed = first_foot == -1
+  only_right = right_touch & ~left_touch
+  only_left = left_touch & ~right_touch
+  first_foot = torch.where(unclaimed & only_right, torch.zeros_like(first_foot), first_foot)
+  first_foot = torch.where(unclaimed & only_left, torch.ones_like(first_foot), first_foot)
+  setattr(env, state_attr, first_foot)
+
+  wrong_foot_touch = ((first_foot == 0) & left_touch) | ((first_foot == 1) & right_touch)
+  return wrong_foot_touch.float()
 
 
 def standing_still_penalty(
@@ -553,12 +672,17 @@ def kick_impact_reward(
   count against you" cone) so the robot can discover kicking at all, then
   tightening to demand real directional accuracy for full credit.
 
-  The window (``env.kick_timer``, steps remaining) and the frozen style
-  multiplier (``env.kick_style`` in [0, 1], see ``foot_medial_alignment``) are
-  owned and set by the ``kick_contact_cycle`` event (mdp/events.py) -- opened on
-  right-foot/ball contact, held for a few seconds so the robot can "farm" reward
-  from the kick's aftermath, then the event resets the ball. This function just
-  reads that shared per-env state; it holds no state of its own.
+  The window (``env.kick_timer``, steps remaining), the frozen style
+  multiplier (``env.kick_style`` in [0, 1], see ``foot_medial_alignment``),
+  and the frozen foot-correctness flag (``env.kick_foot_correct``, see
+  ``select_kick_foot_is_left``) are owned and set by the
+  ``kick_contact_cycle`` event (mdp/events.py) -- opened on ball contact,
+  held for a few seconds so the robot can "farm" reward from the kick's
+  aftermath, then the event resets the ball. This function just reads that
+  shared per-env state; it holds no state of its own. Gated on
+  ``kick_foot_correct`` too: a kick with the wrong foot (per the current
+  ball position/target angle) shouldn't also collect this reward on top of
+  ``ball_kick_contact_reward``'s penalty for the same touch.
   """
   ball: Entity = env.scene[ball_cfg.name]
   timer = getattr(env, "kick_timer", None)
@@ -568,6 +692,9 @@ def kick_impact_reward(
     return torch.zeros_like(ball_speed)
   ball_height = torch.clamp(ball.data.root_link_pos_w[:, 2] - BALL_RADIUS, min=0.0)
   active = timer > 0
+  foot_correct = getattr(env, "kick_foot_correct", None)
+  if foot_correct is not None:
+    active = active & foot_correct
   style = getattr(env, "kick_style", None)
   style = torch.ones_like(ball_speed) if style is None else style
   raw = vel_weight * ball_speed + height_weight * ball_height
