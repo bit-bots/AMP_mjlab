@@ -37,7 +37,6 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.velocity.mdp.rewards import feet_air_time
-from mjlab.utils.noise import GaussianNoiseCfg
 
 from src.assets.objects import get_ball_cfg
 from src.tasks.amp_loco import mdp as amp_mdp
@@ -151,8 +150,11 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       },
     ),
-    # One-hot [kicking, post_kick] -- see kick_state_obs docstring. No
-    # noise: this is task-internal state, not a perception.
+    # One-hot [kicking, post_kick] -- see kick_state_obs docstring. Critic
+    # (value function) only: popped from the actor below. The real robot
+    # has no privileged/perfectly-labeled signal for "am I in the post-kick
+    # window" -- that's exactly the kind of task-internal bookkeeping state
+    # the policy shouldn't get to condition on directly.
     "kick_state": ObservationTermCfg(func=amp_mdp.kick_state_obs),
     # Target kick direction (env.kick_dir_world), rotated into the robot
     # base's yaw frame -- see kick_dir_heading_b docstring. Without this the
@@ -173,16 +175,32 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # adding actor-only noise below would leak into the critic's ground truth.
     for name, term in ball_obs_terms.items():
       grp.terms[name] = copy.copy(term)
+  # kick_state is critic-only -- see its dict entry above.
+  cfg.observations["actor"].terms.pop("kick_state", None)
 
   # Actor-only ball position noise (critic keeps ground truth): models a noisy
-  # ball-tracking perception (e.g. vision) rather than perfect state.
-  cfg.observations["actor"].terms["ball_pos_b"].noise = GaussianNoiseCfg(mean=0.0, std=0.07)
-  # Actor-only random observation delay, up to 0.2s (step_dt=0.02s -> 10
-  # steps), re-sampled per env every step (mjlab's built-in delay pipeline,
-  # see ObservationTermCfg.delay_min_lag/delay_max_lag) -- models the ball
-  # position lagging behind a real perception pipeline. Critic keeps
-  # instantaneous ground truth.
-  cfg.observations["actor"].terms["ball_pos_b"].delay_max_lag = 10
+  # ball-tracking perception (e.g. vision) rather than perfect state. Jumps
+  # from 0.07m to 1.0m std during the post-kick phase (env.kick_timer > 0) --
+  # the real robot's vision loses good track of the ball right after a fast
+  # kick (motion blur/high speed), not just a flat noise floor throughout.
+  # Overrides the clean copy from the loop above (can't use the generic
+  # per-term GaussianNoiseCfg here since the std needs to depend on
+  # per-env kick-phase state).
+  cfg.observations["actor"].terms["ball_pos_b"] = ObservationTermCfg(
+    func=amp_mdp.object_pos_b_noisy,
+    params={
+      "object_cfg": SceneEntityCfg(BALL_NAME),
+      "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
+      "std": 0.07,
+      "std_post_kick": 1.0,
+    },
+    # Actor-only random observation delay, up to 0.2s (step_dt=0.02s -> 10
+    # steps), re-sampled per env every step (mjlab's built-in delay pipeline,
+    # see ObservationTermCfg.delay_min_lag/delay_max_lag) -- models the ball
+    # position lagging behind a real perception pipeline. Critic keeps
+    # instantaneous ground truth.
+    delay_max_lag=10,
+  )
   # Actor-only noisy kick-direction observation: Gaussian noise on the
   # underlying yaw angle (not the raw vector -- see kick_dir_heading_b_noisy
   # docstring for why), std ~5deg. Overrides the clean copy from the loop

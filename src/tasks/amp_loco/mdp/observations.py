@@ -130,6 +130,39 @@ def object_pos_b(
     return pos_b
 
 
+def object_pos_b_noisy(
+    env: ManagerBasedRlEnv,
+    object_cfg: SceneEntityCfg,
+    anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+    std: float = 0.07,
+    std_post_kick: float = 1.0,
+    timer_attr: str = "kick_timer",
+) -> torch.Tensor:
+    """Actor-only noisy variant of ``object_pos_b``: much noisier during the
+    post-kick phase (``timer_attr`` on ``env`` > 0, see ``kick_state_obs``)
+    than during the normal approach -- models the real robot's vision losing
+    good track of the ball right after a fast kick (motion blur / high ball
+    speed), not just a flat perception-noise floor throughout.
+
+    Noise is applied here (per-env-conditional std), not via the generic
+    ``ObservationTermCfg.noise`` pipeline (a single fixed ``GaussianNoiseCfg``
+    can't vary by state); ``ObservationTermCfg.delay_max_lag`` still applies
+    downstream as normal.
+    """
+    pos_b = object_pos_b(env, object_cfg, anchor_cfg)
+    timer = getattr(env, timer_attr, None)
+    if timer is None:
+        post_kick = torch.zeros(pos_b.shape[0], dtype=torch.bool, device=pos_b.device)
+    else:
+        post_kick = timer > 0
+    sigma = torch.where(
+        post_kick,
+        torch.full_like(pos_b[:, 0], std_post_kick),
+        torch.full_like(pos_b[:, 0], std),
+    )
+    return pos_b + torch.randn_like(pos_b) * sigma.unsqueeze(-1)
+
+
 def object_lin_vel_b(
     env: ManagerBasedRlEnv,
     object_cfg: SceneEntityCfg,
