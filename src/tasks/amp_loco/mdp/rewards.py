@@ -546,6 +546,26 @@ def ball_kick_contact_reward(
   return torch.where(new_contact, reward, torch.zeros_like(reward))
 
 
+def contact_sensor_touched(sensor: ContactSensor, force_threshold: float = 0.1) -> torch.Tensor:
+  """Whether a contact registered at ANY substep within the current control
+  step, not just the final one ``found`` samples -- a fast strike-and-
+  separate can happen entirely within one step's decimation loop and be
+  invisible to ``found`` alone (confirmed empirically: ball visibly moves,
+  ``found`` never shows touching that step).
+
+  Uses ``force_history`` (populated when the sensor's ``fields`` includes
+  "force" and ``history_length`` is set to at least the sim's decimation --
+  see ``ContactSensorCfg``'s docstring) if available, falling back to plain
+  ``found`` otherwise.
+  """
+  data = sensor.data
+  if data.force_history is not None:
+    force_mag = torch.norm(data.force_history, dim=-1)  # [B, N, H]
+    return (force_mag > force_threshold).any(dim=(1, 2))
+  assert data.found is not None
+  return (data.found > 0).any(dim=-1)
+
+
 def cross_foot_touch_penalty(
   env: ManagerBasedRlEnv,
   right_sensor_name: str,
@@ -569,9 +589,8 @@ def cross_foot_touch_penalty(
   """
   right: ContactSensor = env.scene[right_sensor_name]
   left: ContactSensor = env.scene[left_sensor_name]
-  assert right.data.found is not None and left.data.found is not None
-  right_touch = (right.data.found > 0).any(dim=-1)
-  left_touch = (left.data.found > 0).any(dim=-1)
+  right_touch = contact_sensor_touched(right)
+  left_touch = contact_sensor_touched(left)
 
   first_foot = getattr(env, state_attr, None)
   if first_foot is None:
@@ -611,6 +630,25 @@ def standing_still_penalty(
   not_touched_yet = torch.ones_like(speed, dtype=torch.bool) if claimed is None else ~claimed
   standing_still = speed < vel_threshold
   return (standing_still & not_touched_yet).float()
+
+
+def post_kick_velocity_penalty(
+  env: ManagerBasedRlEnv,
+  anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+  timer_attr: str = "kick_timer",
+) -> torch.Tensor:
+  """Penalize the anchor's own horizontal speed (squared) during the
+  post-kick window (``env.kick_timer`` > 0, see ``kick_state_obs``) --
+  encourages the robot to stop/settle after striking the ball instead of
+  continuing to run through or past it. Zero outside the window.
+  """
+  robot: Entity = env.scene[anchor_cfg.name]
+  vel_xy = robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2]
+  speed_sq = torch.sum(vel_xy * vel_xy, dim=-1)
+  timer = getattr(env, timer_attr, None)
+  if timer is None:
+    return torch.zeros_like(speed_sq)
+  return torch.where(timer > 0, speed_sq, torch.zeros_like(speed_sq))
 
 
 def foot_medial_alignment(

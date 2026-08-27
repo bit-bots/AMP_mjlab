@@ -46,6 +46,11 @@ from src.tasks.amp_loco.config.piplus.env_cfgs import (
   SITE_NAMES,
   piplus_amp_flat_env_cfg,
 )
+from src.tasks.amp_loco.mdp.terrain import (
+  KICK_TERRAIN_CFG,
+  KICK_TERRAIN_FLAT_COLS,
+  KICK_TERRAIN_NONFLAT_COLS,
+)
 
 BALL_NAME = "ball"
 BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball.py)
@@ -111,6 +116,23 @@ KICK_DIR_SIGMA_END = math.radians(15.0)
 def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = piplus_amp_flat_env_cfg(play=play)
 
+  # --- Terrain: mostly flat, ramping toward mostly non-flat over training --
+  # piplus_amp_flat_env_cfg leaves a plain flat plane (no columns to choose
+  # between); swap in the generator grid (KICK_TERRAIN_CFG, mdp/terrain.py)
+  # so terrain_flat_fraction_curriculum (below) has flat/tilted/perlin
+  # columns to reassign resetting envs between. Contact budgets bumped back
+  # up from the flat cfg's reduced values (a plain plane needs far fewer
+  # contacts than heightfield/mesh terrain) -- not as high as the rough
+  # cfg's, since only a fraction of envs are ever on non-flat ground and the
+  # features are deliberately mild.
+  cfg.scene.terrain.terrain_type = "generator"
+  cfg.scene.terrain.terrain_generator = KICK_TERRAIN_CFG
+  cfg.scene.terrain.max_init_terrain_level = None
+  cfg.sim.njmax = 1200
+  cfg.sim.mujoco.ccd_iterations = 150
+  cfg.sim.contact_sensor_maxmatch = 400
+  cfg.sim.nconmax = 128
+
   # --- Ball entity --------------------------------------------------------
   cfg.scene.entities[BALL_NAME] = get_ball_cfg()
 
@@ -118,21 +140,28 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Used only by cross_foot_touch_penalty below (which foot touched the ball
   # first each life) -- NOT for a foot-restriction termination, there isn't
   # one anymore.
+  # history_length=4 (matching cfg.decimation) + "force" in fields: makes
+  # contact_sensor_touched (mdp/rewards.py) see EVERY physics substep within
+  # a control step, not just the last one -- a fast strike-and-separate can
+  # happen entirely within one step's decimation loop and be invisible to
+  # `found` (sampled once per step) alone.
   r_foot_ball_cfg = ContactSensorCfg(
     name="r_foot_ball_contact",
     primary=ContactMatch(mode="subtree", pattern=RIGHT_FOOT_SUBTREE, entity="robot"),
     secondary=ContactMatch(mode="body", pattern=BALL_ENTITY_BODY_NAME, entity=BALL_NAME),
-    fields=("found",),
+    fields=("found", "force"),
     reduce="none",
     num_slots=1,
+    history_length=4,
   )
   l_foot_ball_cfg = ContactSensorCfg(
     name="l_foot_ball_contact",
     primary=ContactMatch(mode="subtree", pattern=LEFT_FOOT_SUBTREE, entity="robot"),
     secondary=ContactMatch(mode="body", pattern=BALL_ENTITY_BODY_NAME, entity=BALL_NAME),
-    fields=("found",),
+    fields=("found", "force"),
     reduce="none",
     num_slots=1,
+    history_length=4,
   )
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (r_foot_ball_cfg, l_foot_ball_cfg)
 
@@ -251,6 +280,14 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       "vel_threshold": 0.15,
     },
+  )
+  # Penalize the robot's own speed during the post-kick window -- encourages
+  # it to stop/settle after striking the ball instead of running through or
+  # past it while the ball is still being "farmed" for kick_impact reward.
+  cfg.rewards["post_kick_stop"] = RewardTermCfg(
+    func=amp_mdp.post_kick_velocity_penalty,
+    weight=-0.3,
+    params={"anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,))},
   )
   # Small dense reward for facing the ball (mirrors mjxperiment's
   # _reward_orient_to_ball) -- helps line up a proper kick approach rather
@@ -443,6 +480,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
       "anchor_body_name": ANCHOR_NAME,
       "angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
+      "right_ball_sensor_name": "r_foot_ball_contact",
+      "left_ball_sensor_name": "l_foot_ball_contact",
     },
   )
 
@@ -527,6 +566,20 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "end_step": 14000 * 24,
       "start_value": KICK_DIR_SIGMA_START,
       "end_value": KICK_DIR_SIGMA_END,
+    },
+  )
+  # Ramp the fraction of envs on non-flat terrain (KICK_TERRAIN_CFG above)
+  # from 1/10 at the start of training to 2/3 by iteration 12000, so the
+  # policy first learns to approach/kick on flat ground before having to
+  # cope with uneven footing too.
+  cfg.curriculum["terrain_nonflat_fraction"] = CurriculumTermCfg(
+    func=amp_mdp.terrain_flat_fraction_curriculum,
+    params={
+      "flat_cols": KICK_TERRAIN_FLAT_COLS,
+      "nonflat_cols": KICK_TERRAIN_NONFLAT_COLS,
+      "start_nonflat_frac": 0.1,
+      "end_nonflat_frac": 2.0 / 3.0,
+      "end_step": 12000 * 24,
     },
   )
 

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from src.assets.objects import BALL_RADIUS
 from src.tasks.amp_loco.ampmotion_loader import MotionLoader
 from src.tasks.amp_loco.mdp.rewards import (
+    contact_sensor_touched,
     foot_medial_alignment,
     local_kick_dir_xy,
     select_kick_foot_is_left,
@@ -22,6 +23,10 @@ from src.tasks.amp_loco.mdp.rewards import (
 from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+# Extra height above the estimated local ground level to spawn the ball at
+# -- see _place_ball_near_robot -- so small terrain-height estimation error
+# never buries it.
+_BALL_SPAWN_HEIGHT_MARGIN = 0.05
 
 
 class MotionResetManager:
@@ -340,9 +345,24 @@ def _place_ball_near_robot(
     right = torch.stack([torch.sin(robot_yaw), -torch.cos(robot_yaw)], dim=-1)
     offset = forward * dist.unsqueeze(-1) + right * side.unsqueeze(-1)
 
+    # Ground level is BALL_RADIUS above the robot's own terrain patch
+    # baseline (env_origins' z), not a fixed world z=0 -- a non-flat terrain
+    # patch (e.g. KICK_TERRAIN_CFG's tilted-grid platform) can sit well
+    # above/below world z=0, and spawning at a fixed world height would
+    # bury or float the ball. env_origins reflects the patch the robot was
+    # last placed on, which is a good local approximation (not exact -- the
+    # ball's own xy offset can be on slightly different local terrain
+    # height, e.g. a Perlin bump/dip) since the ball always spawns close to
+    # the robot. A small extra margin (_BALL_SPAWN_HEIGHT_MARGIN) on top
+    # absorbs that residual error on the safe side: a ball that spawns
+    # slightly too high just drops the last centimeters under gravity,
+    # while one that spawns embedded in the ground can get shoved out by a
+    # sudden contact-resolution impulse -- which, combined with a foot
+    # happening to be nearby, could even register as a false "kick".
+    ground_z = env.scene.env_origins[env_ids, 2]
     pose = torch.zeros((n, 7), device=env.device)
     pose[:, 0:2] = robot_xy + offset
-    pose[:, 2] = BALL_RADIUS
+    pose[:, 2] = ground_z + BALL_RADIUS + _BALL_SPAWN_HEIGHT_MARGIN
     pose[:, 3] = 1.0  # identity quat (w,x,y,z)
     ball.write_root_link_pose_to_sim(pose, env_ids=env_ids)
     ball.write_root_link_velocity_to_sim(torch.zeros((n, 6), device=env.device), env_ids=env_ids)
@@ -409,11 +429,21 @@ class kick_contact_cycle:
     ``foot_medial_alignment_penalty``), not a state machine here.
 
     **post-kick** (``env.kick_timer`` > 0). Entered once the ball's speed
-    exceeds ``impact_speed_threshold`` while kicking; holds for ``window_s``
-    seconds so the robot can "farm" reward from the kick's aftermath, then
-    the ball resets (new random position in front of the robot + zero
-    velocity, fresh target kick direction) WITHOUT ending the episode, and
-    the cycle returns to kicking.
+    exceeds ``impact_speed_threshold`` AND an actual foot/ball contact is
+    registered (see ``contact_sensor_touched``, mdp/rewards.py) while
+    kicking; holds for ``window_s`` seconds so the robot can "farm" reward
+    from the kick's aftermath, then the ball resets (new random position in
+    front of the robot + zero velocity, fresh target kick direction)
+    WITHOUT ending the episode, and the cycle returns to kicking.
+
+    Speed alone isn't enough to detect a kick: on non-flat terrain
+    (KICK_TERRAIN_CFG) a resting ball can pick up real velocity from
+    gravity alone (rolling down a tilted tile, settling off a bump) with no
+    foot anywhere near it. Contact alone isn't enough either: the
+    continuous per-step version paid out for every step of contact,
+    letting the policy learn to just rest a foot on the ball. Combining
+    both -- a real velocity change AND a real touch -- rules out both
+    failure modes.
 
     ``env.kick_timer`` (steps remaining in the post-kick window) and
     ``env.kick_style`` (the CLOSER foot's ball alignment quality at the
@@ -454,6 +484,10 @@ class kick_contact_cycle:
         anchor_body_name = cfg.params.get("anchor_body_name", "torso_link")
         self._anchor_body_id = self._robot.find_bodies(anchor_body_name)[0][0]
         self._angle_threshold_deg = cfg.params.get("angle_threshold_deg", 20.0)
+        right_sensor_name = cfg.params.get("right_ball_sensor_name", "r_foot_ball_contact")
+        left_sensor_name = cfg.params.get("left_ball_sensor_name", "l_foot_ball_contact")
+        self._right_ball_sensor = env.scene[right_sensor_name]
+        self._left_ball_sensor = env.scene[left_sensor_name]
         env.kick_timer = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         env.kick_style = torch.zeros(env.num_envs, device=env.device)
         env.kick_new_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -503,25 +537,31 @@ class kick_contact_cycle:
         kick_dir_cone_deg: float = 80.0,
         anchor_body_name: str = "torso_link",
         angle_threshold_deg: float = 20.0,
+        right_ball_sensor_name: str = "r_foot_ball_contact",
+        left_ball_sensor_name: str = "l_foot_ball_contact",
     ) -> None:
         del (
             env_ids, robot_cfg, ball_cfg, foot_body_names, medial_signs,
             impact_speed_threshold, window_s, dist_range, lateral_range, kick_dir_cone_deg,
-            anchor_body_name, angle_threshold_deg,
+            anchor_body_name, angle_threshold_deg, right_ball_sensor_name, left_ball_sensor_name,
         )
         # All params unused here; resolved once in __init__.
 
-        # Ball velocity, not a foot/ball contact sensor: a fast strike can
-        # make contact and separate again within a single RL step's physics
-        # substeps, which a contact sensor (sampled once per RL step, after
-        # all substeps) can silently miss even though the ball was genuinely
-        # struck -- confirmed empirically (ball visibly moves, sensor never
-        # shows touching that step). Ball velocity is an integrated physics
-        # state that persists past the moment of contact, so it doesn't have
-        # this blind spot. See ball_kick_contact_reward (mdp/rewards.py), which
-        # uses the same signal.
+        # Ball speed exceeding the threshold alone isn't enough: on
+        # non-flat terrain (KICK_TERRAIN_CFG) a resting ball can pick up
+        # real velocity from gravity alone (rolling down a tilted tile,
+        # settling off a bump) with no foot anywhere near it. Require an
+        # ACTUAL foot/ball contact too -- contact_sensor_touched
+        # (mdp/rewards.py) checks every physics substep within the control
+        # step (via the sensors' force_history), not just the final one, so
+        # a fast strike-and-separate within one step's decimation loop
+        # still counts even though it wouldn't show up in a plain
+        # end-of-step ``found`` check.
         ball_speed = torch.norm(self._ball.data.root_link_lin_vel_w[:, :2], dim=-1)
-        kicked = ball_speed > self._impact_speed_threshold
+        foot_touching = contact_sensor_touched(self._right_ball_sensor) | contact_sensor_touched(
+            self._left_ball_sensor
+        )
+        kicked = (ball_speed > self._impact_speed_threshold) & foot_touching
 
         idle = env.kick_timer == 0
         new_contact = kicked & idle

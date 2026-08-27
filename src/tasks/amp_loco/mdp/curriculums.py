@@ -105,6 +105,60 @@ def disable_termination_at_step(
   return torch.tensor(float(term_cfg.params.get("enabled", True)))
 
 
+def terrain_flat_fraction_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  flat_cols: tuple[int, ...],
+  nonflat_cols: tuple[int, ...],
+  start_nonflat_frac: float,
+  end_nonflat_frac: float,
+  end_step: int,
+) -> torch.Tensor:
+  """On every reset, reassign each resetting env's terrain COLUMN (not row --
+  see ``TerrainGeneratorCfg``/``TerrainEntity`` in mjlab.terrains): the
+  probability of landing on a non-flat column ramps linearly from
+  ``start_nonflat_frac`` (at step 0) to ``end_nonflat_frac`` (at
+  ``end_step``), held flat thereafter. Only resetting envs are touched, so
+  the actual population fraction converges to the scheduled target as
+  episodes churn, not instantaneously.
+
+  Must run BEFORE the reset-mode events that place the robot -- it does,
+  since ``ManagerBasedRlEnv._reset_idx`` calls ``curriculum_manager.compute()``
+  ahead of ``event_manager.apply(mode="reset", ...)``, and
+  ``reset_from_motion_data`` reads ``env.scene.env_origins`` (which this
+  mutates via ``terrain.env_origins``) to place the robot.
+
+  No-op if the scene has no procedural terrain generator (e.g. a plain
+  flat-plane terrain, which has no columns to choose between).
+  """
+  terrain = env.scene.terrain
+  if terrain is None or terrain.terrain_origins is None:
+    return torch.tensor(0.0)
+
+  step = env.common_step_counter
+  frac = min(max(step / max(end_step, 1), 0.0), 1.0)
+  nonflat_frac = start_nonflat_frac + (end_nonflat_frac - start_nonflat_frac) * frac
+
+  n = env_ids.shape[0]
+  is_nonflat = torch.rand(n, device=env.device) < nonflat_frac
+  flat_cols_t = torch.tensor(flat_cols, device=env.device)
+  nonflat_cols_t = torch.tensor(nonflat_cols, device=env.device)
+  flat_choice = flat_cols_t[torch.randint(0, len(flat_cols), (n,), device=env.device)]
+  nonflat_choice = nonflat_cols_t[
+    torch.randint(0, len(nonflat_cols), (n,), device=env.device)
+  ]
+  chosen_cols = torch.where(is_nonflat, nonflat_choice, flat_choice)
+
+  terrain.terrain_types[env_ids] = chosen_cols
+  # Row (difficulty level) is left as whatever each env already has -- rows
+  # aren't used as a difficulty axis here, just extra random variety within
+  # a chosen column.
+  terrain.env_origins[env_ids] = terrain.terrain_origins[
+    terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]
+  ]
+  return torch.tensor(nonflat_frac)
+
+
 def bump_reward_weight_at_step(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,
