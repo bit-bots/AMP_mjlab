@@ -25,8 +25,11 @@ from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 # Extra height above the estimated local ground level to spawn the ball at
 # -- see _place_ball_near_robot -- so small terrain-height estimation error
-# never buries it.
-_BALL_SPAWN_HEIGHT_MARGIN = 0.05
+# never buries it. Sized to clear KICK_TERRAIN_CFG's tilted_grid worst case:
+# a tile corner can sit up to ~(height_range/2 + tilt-induced rise) above
+# the patch's flat env_origins baseline (~0.026m at its current settings);
+# 0.08 leaves comfortable headroom above that.
+_BALL_SPAWN_HEIGHT_MARGIN = 0.08
 
 
 class MotionResetManager:
