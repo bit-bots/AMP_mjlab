@@ -445,6 +445,26 @@ def foot_slip_penalty(
   return torch.sum(vel_xy_norm_sq * in_contact, dim=1)
 
 
+def foot_base_proximity_penalty(
+  env: ManagerBasedRlEnv,
+  foot_cfg: SceneEntityCfg,
+  base_cfg: SceneEntityCfg,
+  min_dist: float = 0.4,
+) -> torch.Tensor:
+  """Penalize a foot getting closer than ``min_dist`` to the base_link body
+  (straight-line 3D distance) -- discourages unnatural tucked-leg poses or
+  a foot swinging in close to the torso/base instead of out toward the
+  ball. 0 when at or beyond ``min_dist``, growing linearly as it gets
+  closer, so the gradient still points away from the base even well
+  inside the violation zone.
+  """
+  robot: Entity = env.scene[foot_cfg.name]
+  foot_pos = robot.data.body_link_pos_w[:, foot_cfg.body_ids[0]]
+  base_pos = robot.data.body_link_pos_w[:, base_cfg.body_ids[0]]
+  dist = torch.norm(foot_pos - base_pos, dim=-1)
+  return torch.clamp(min_dist - dist, min=0.0)
+
+
 def object_contact_reward(
   env: ManagerBasedRlEnv,
   sensor_name: str,

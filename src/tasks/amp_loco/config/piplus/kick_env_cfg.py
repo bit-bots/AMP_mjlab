@@ -42,6 +42,7 @@ from src.assets.objects import get_ball_cfg
 from src.tasks.amp_loco import mdp as amp_mdp
 from src.tasks.amp_loco.config.piplus.env_cfgs import (
   ANCHOR_NAME,
+  ROOT_NAME,
   SITE_NAMES,
   piplus_amp_flat_env_cfg,
 )
@@ -71,6 +72,9 @@ KICK_WINDOW_S = 1.0
 # Bumped from 0.5 so the foot starts turning to line up the medial edge earlier
 # in the approach, not just in the last half-meter.
 FOOT_ALIGNMENT_CLOSE_DIST = 0.9
+# foot_base_proximity_penalty's minimum allowed foot-to-base_link distance --
+# discourages tucked-leg poses instead of genuinely reaching/stepping.
+FOOT_BASE_MIN_DIST = 0.3
 # move_to_ball/torso_orient_to_ball measure from a point 20cm to the side of
 # the anchor (torso) instead of the anchor's own origin -- lines the approach
 # up around whichever foot select_kick_foot_is_left currently picks, rather
@@ -373,6 +377,27 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "foot_cfg": SceneEntityCfg("robot", body_names=(LEFT_FOOT_SUBTREE,)),
       "medial_sign": -1.0,  # -Y is medial for the left foot (see rewards.py docstring).
       "close_dist": FOOT_ALIGNMENT_CLOSE_DIST,
+    },
+  )
+  # Significant penalty for a foot swinging in closer than FOOT_BASE_MIN_DIST
+  # to the base_link -- discourages unnatural tucked-leg poses instead of
+  # actually stepping/reaching out toward the ball.
+  cfg.rewards["foot_base_proximity_right"] = RewardTermCfg(
+    func=amp_mdp.foot_base_proximity_penalty,
+    weight=-50.0,
+    params={
+      "foot_cfg": SceneEntityCfg("robot", body_names=(RIGHT_FOOT_SUBTREE,)),
+      "base_cfg": SceneEntityCfg("robot", body_names=(ROOT_NAME,)),
+      "min_dist": FOOT_BASE_MIN_DIST,
+    },
+  )
+  cfg.rewards["foot_base_proximity_left"] = RewardTermCfg(
+    func=amp_mdp.foot_base_proximity_penalty,
+    weight=-50.0,
+    params={
+      "foot_cfg": SceneEntityCfg("robot", body_names=(LEFT_FOOT_SUBTREE,)),
+      "base_cfg": SceneEntityCfg("robot", body_names=(ROOT_NAME,)),
+      "min_dist": FOOT_BASE_MIN_DIST,
     },
   )
   # Discourage double-touching the ball with both feet: once one foot has
