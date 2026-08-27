@@ -523,12 +523,14 @@ def ball_kick_contact_reward(
   again until the ball is repositioned.
 
   Sourced entirely from ``kick_contact_cycle`` (mdp/events.py), which is the
-  single authority on "did a kick just happen" (via ball velocity, not a
-  foot/ball contact sensor -- a fast strike can separate within one RL
-  step's physics substeps, which a contact sensor sampled once per step can
-  miss) and "which foot actually did it" (whichever configured foot was
-  closest to the ball at that moment). ``env.kick_new_contact`` is a
-  transient this-event-round flag (overwritten every step, not held) and
+  single authority on "did a kick just happen" (a ball-speed spike AND a
+  genuine foot/ball contact-sensor touch, via ``contact_sensor_touched`` --
+  speed alone false-triggers from gravity/terrain motion on non-flat
+  ground, and contact alone would let the policy "rest" a foot on the ball,
+  so both are required) and "which foot actually did it" (whichever
+  configured foot was closest to the ball at that moment).
+  ``env.kick_new_contact`` is a transient this-event-round flag (overwritten
+  every step, not held) and
   ``env.kick_foot_correct`` is frozen for the whole post-kick window --
   this function only reads them, it holds no state of its own.
   """
