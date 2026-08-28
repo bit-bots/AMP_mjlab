@@ -614,11 +614,21 @@ def standing_still_penalty(
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
   vel_threshold: float = 0.15,
   state_attr: str = "contact_reward_claimed",
+  timer_attr: str = "kick_timer",
 ) -> torch.Tensor:
   """Flat penalty for near-zero root speed before the ball has been touched
   (in the current ball "life" -- see ``first_object_contact_reward``'s
   ``contact_reward_claimed``, cleared on every ball reset, so this re-applies
-  after every kick too, not just at episode start).
+  after every kick too, not just at episode start) and outside the post-kick
+  window (``env.kick_timer`` > 0, see ``post_kick_velocity_penalty``), which
+  wants the opposite -- the robot settling, not moving toward the
+  (already-struck) ball.
+
+  Note: ``contact_reward_claimed`` is only ever set by
+  ``first_object_contact_reward``, which this task doesn't register as an
+  active reward term -- so that gate is currently a no-op (always "not
+  touched yet") and ``timer_attr`` is what actually keeps this from fighting
+  ``post_kick_stop`` during the post-kick window.
 
   Flat (not proportional to how slow) so it can't be cheaply "paid off" by
   drifting just above zero -- either the robot is genuinely moving toward the
@@ -630,8 +640,10 @@ def standing_still_penalty(
   speed = torch.norm(robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2], dim=-1)
   claimed = getattr(env, state_attr, None)
   not_touched_yet = torch.ones_like(speed, dtype=torch.bool) if claimed is None else ~claimed
+  timer = getattr(env, timer_attr, None)
+  not_post_kick = torch.ones_like(speed, dtype=torch.bool) if timer is None else timer == 0
   standing_still = speed < vel_threshold
-  return (standing_still & not_touched_yet).float()
+  return (standing_still & not_touched_yet & not_post_kick).float()
 
 
 def post_kick_velocity_penalty(

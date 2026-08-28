@@ -29,7 +29,10 @@ import copy
 import math
 import os
 
+import torch
+
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp import dr
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
@@ -38,7 +41,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.velocity.mdp.rewards import feet_air_time
 
-from src.assets.objects import get_ball_cfg
+from src.assets.objects import BALL_GEOM_NAME, get_ball_cfg
 from src.tasks.amp_loco import mdp as amp_mdp
 from src.tasks.amp_loco.config.piplus.env_cfgs import (
   ANCHOR_NAME,
@@ -56,6 +59,45 @@ BALL_NAME = "ball"
 BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball.py)
 RIGHT_FOOT_SUBTREE = "r_ankle_roll_link"
 LEFT_FOOT_SUBTREE = "l_ankle_roll_link"
+
+
+def _clamped_gaussian_sample(mean, std, shape, device):
+  """Gaussian sample clamped to +/-3 std, so a tail draw can't produce a
+  degenerate (non-positive) scale factor for a physical quantity like ball
+  radius/mass. Only clips the ~0.3% tail, so the requested std is preserved
+  almost exactly everywhere else.
+
+  Deliberately doesn't delegate to mjlab's ``sample_gaussian``: the DR engine
+  (``_generate_random_values``, dr/_core.py) always calls distributions with
+  ``mean``/``std`` pre-wrapped as shape-``(1,)`` tensors, and
+  ``sample_gaussian``'s tensor branch calls ``torch.normal(mean=mean,
+  std=std)`` directly -- which returns a tensor shaped like ``mean``/``std``
+  (i.e. a single value), silently ignoring ``shape`` entirely. In this DR
+  engine that means every env would get the SAME sampled scale factor
+  instead of independent ones (confirmed empirically: identical radius/mass
+  across all envs). Sampling standard noise at the requested ``shape``
+  ourselves and scaling it sidesteps that.
+  """
+  mean_t = torch.as_tensor(mean, device=device, dtype=torch.float32)
+  std_t = torch.as_tensor(std, device=device, dtype=torch.float32)
+  samples = mean_t + torch.randn(*shape, device=device) * std_t
+  return torch.clamp(samples, min=mean_t - 3 * std_t, max=mean_t + 3 * std_t)
+
+
+# +/-20% std scale factor, reused for both ball radius and mass -- each
+# sampled independently (not coupled through a shared density), matching how
+# they were requested.
+_BALL_SIZE_MASS_DIST = dr.Distribution(
+  name="clamped_gaussian", sample=_clamped_gaussian_sample
+)
+BALL_SIZE_MASS_SCALE_RANGE = (1.0, 0.2)  # (mean, std) scale factor.
+# Sliding (tangential) friction: heavy randomization, since foot/ball contact
+# behavior during a kick is sensitive to it and we don't have a good prior for
+# the right value. log_uniform keeps samples positive and spreads them
+# multiplicatively around the nominal 0.6 rather than linearly. Rolling
+# (axis 2) already looks right and torsional (axis 1) wasn't flagged, so
+# both are left at their fixed nominal values (see BALL_FRICTION, ball.py).
+BALL_SLIDING_FRICTION_RANGE = (0.1, 1.6)
 
 # Ball spawn/respawn geometry: forward distance from the robot + a
 # distance-scaled lateral offset (see _place_ball_near_robot, mdp/events.py)
@@ -135,6 +177,42 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Ball entity --------------------------------------------------------
   cfg.scene.entities[BALL_NAME] = get_ball_cfg()
+
+  # --- Ball physics randomization ------------------------------------------
+  # Sampled once per env at startup (matching foot_friction/base_com below),
+  # not resampled every episode.
+  cfg.events["ball_size"] = EventTermCfg(
+    mode="startup",
+    func=dr.geom_size,
+    params={
+      "asset_cfg": SceneEntityCfg(BALL_NAME, geom_names=(BALL_GEOM_NAME,)),
+      "operation": "scale",
+      "distribution": _BALL_SIZE_MASS_DIST,
+      "ranges": BALL_SIZE_MASS_SCALE_RANGE,
+      "axes": [0],  # radius, for a sphere geom.
+    },
+  )
+  cfg.events["ball_mass"] = EventTermCfg(
+    mode="startup",
+    func=dr.body_mass,
+    params={
+      "asset_cfg": SceneEntityCfg(BALL_NAME, body_names=(BALL_ENTITY_BODY_NAME,)),
+      "operation": "scale",
+      "distribution": _BALL_SIZE_MASS_DIST,
+      "ranges": BALL_SIZE_MASS_SCALE_RANGE,
+    },
+  )
+  cfg.events["ball_sliding_friction"] = EventTermCfg(
+    mode="startup",
+    func=dr.geom_friction,
+    params={
+      "asset_cfg": SceneEntityCfg(BALL_NAME, geom_names=(BALL_GEOM_NAME,)),
+      "operation": "abs",
+      "distribution": "log_uniform",
+      "ranges": BALL_SLIDING_FRICTION_RANGE,
+      "axes": [0],
+    },
+  )
 
   # --- Per-foot ball contact sensors ---------------------------------------
   # Used only by cross_foot_touch_penalty below (which foot touched the ball

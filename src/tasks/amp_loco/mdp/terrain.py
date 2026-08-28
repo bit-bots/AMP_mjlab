@@ -175,20 +175,25 @@ RANDOM_ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
 
 # Kick task: flat / tilted-grid / Perlin-noise mix, deliberately mild --
 # the Pi Plus is small and the target scenario is playing on roughly even
-# grass, not rugged off-road terrain. curriculum=True with 3 equal-
-# proportion sub-terrains and num_cols a multiple of 3 gives an exact,
-# predictable column split (verified against TerrainGenerator's cumulative-
-# proportion column assignment): cols [0:4)=flat, [4:8)=tilted_grid,
-# [8:12)=perlin -- see KICK_TERRAIN_FLAT_COLS/KICK_TERRAIN_NONFLAT_COLS
-# below, which terrain_flat_fraction_curriculum (mdp/curriculums.py) uses
-# to reassign envs between them over training.
-KICK_TERRAIN_FLAT_COLS = (0, 1, 2, 3)
-KICK_TERRAIN_NONFLAT_COLS = (4, 5, 6, 7, 8, 9, 10, 11)
+# grass, not rugged off-road terrain. Each non-flat type comes in a mild and
+# a rough variant (same shape, higher height_range/tilt) so half of all
+# non-flat ground is noticeably bumpier, not just the same mild texture
+# everywhere. curriculum=True with 5 equal-proportion sub-terrains and
+# num_cols a multiple of 5 gives an exact, predictable column split
+# (verified against TerrainGenerator's cumulative-proportion column
+# assignment): cols [0:3)=flat, [3:6)=tilted_mild, [6:9)=tilted_rough,
+# [9:12)=perlin_mild, [12:15)=perlin_rough -- see
+# KICK_TERRAIN_FLAT_COLS/KICK_TERRAIN_NONFLAT_COLS below, which
+# terrain_flat_fraction_curriculum (mdp/curriculums.py) uses to reassign
+# envs between them over training (uniformly within each group, so the
+# mild/rough split stays ~50/50 among non-flat envs throughout).
+KICK_TERRAIN_FLAT_COLS = (0, 1, 2)
+KICK_TERRAIN_NONFLAT_COLS = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
 KICK_TERRAIN_CFG = TerrainGeneratorCfg(
   size=(6.0, 6.0),
   border_width=10.0,
   num_rows=2,
-  num_cols=12,
+  num_cols=15,
   curriculum=True,
   sub_terrains={
     "flat": terrain_gen.BoxFlatTerrainCfg(proportion=1.0),
@@ -202,11 +207,21 @@ KICK_TERRAIN_CFG = TerrainGeneratorCfg(
     # BoxTiltedGridTerrainCfg's default), and use_platform=False removes
     # the smooth interior spawn square (and the seam/"canyon" ring its
     # misaligned boundary left around it) for uniform coverage instead.
-    "tilted_grid": GroundedTiltedGridTerrainCfg(
+    "tilted_mild": GroundedTiltedGridTerrainCfg(
       proportion=1.0,
       grid_width=0.3,
       tilt_range_deg=3.0,
       height_range=0.02,
+      border_width=0.25,
+      base_h=0.0,
+      floor_depth=0.15,
+      use_platform=False,
+    ),
+    "tilted_rough": GroundedTiltedGridTerrainCfg(
+      proportion=1.0,
+      grid_width=0.3,
+      tilt_range_deg=6.0,
+      height_range=0.045,
       border_width=0.25,
       base_h=0.0,
       floor_depth=0.15,
@@ -221,7 +236,7 @@ KICK_TERRAIN_CFG = TerrainGeneratorCfg(
     # full period across the 6m patch, producing one giant, nearly-flat
     # gradient instead of texture. scale=12 gives a ~0.5m period (foot/
     # grass-sized); octaves=3 layers finer detail on top.
-    "perlin": terrain_gen.HfPerlinNoiseTerrainCfg(
+    "perlin_mild": terrain_gen.HfPerlinNoiseTerrainCfg(
       proportion=1.0,
       height_range=(0.02, 0.04),
       scale=12.0,
@@ -230,6 +245,14 @@ KICK_TERRAIN_CFG = TerrainGeneratorCfg(
       # quarters the triangle density. The default combination triggered
       # MuJoCo's "height field collision overflow" warning (>=50
       # simultaneous candidate triangles under a single geom).
+      resolution=0.1,
+      border_width=0.25,
+    ),
+    "perlin_rough": terrain_gen.HfPerlinNoiseTerrainCfg(
+      proportion=1.0,
+      height_range=(0.05, 0.08),
+      scale=12.0,
+      octaves=3,
       resolution=0.1,
       border_width=0.25,
     ),
