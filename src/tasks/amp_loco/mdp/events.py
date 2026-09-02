@@ -548,6 +548,15 @@ class kick_contact_cycle:
         direction. Auto-invoked by EventManager.debug_vis for any
         class-based event term that defines this method -- no extra cfg flag
         needed.
+
+        Colored by ``env.kick_strong`` (red = strong, blue = weak -- same
+        colors as BALL_STRONG_RGBA/BALL_WEAK_RGBA). This is the visual
+        strong/weak cue instead of recoloring the ball geom itself: mjlab's
+        viser viewer bakes a dynamic mesh's color in at construction and has
+        no runtime color update for it (see mjlab/viewer/viser/scene.py's
+        add_batched_meshes_trimesh docstring), but debug-vis primitives like
+        this arrow go through a batched-mesh path that DOES support a
+        per-frame color update, so this is what actually shows up live.
         """
         env = self._env
         ball_pos = self._ball.data.root_link_pos_w
@@ -558,7 +567,8 @@ class kick_contact_cycle:
             end = start.clone()
             end[0] = start[0] + kick_dir[env_idx, 0] * length
             end[1] = start[1] + kick_dir[env_idx, 1] * length
-            visualizer.add_arrow(start, end, color=(1.0, 0.6, 0.0, 0.9), width=0.015, label="kick_dir")
+            color = BALL_STRONG_RGBA if env.kick_strong[env_idx] else BALL_WEAK_RGBA
+            visualizer.add_arrow(start, end, color=color, width=0.015, label="kick_dir")
 
     def __call__(
         self,

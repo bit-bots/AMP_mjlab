@@ -118,7 +118,7 @@ KICK_DIR_CONE_DEG = 80.0
 STRONG_KICK_PROB = 0.5
 # Weak-kick speed cap (m/s, ball post-kick speed) -- see
 # weak_kick_speed_penalty. Only enforced on a weak-kick life.
-WEAK_KICK_MAX_SPEED = 1.0
+WEAK_KICK_MAX_SPEED = 2.0
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
