@@ -113,6 +113,12 @@ BALL_LATERAL_RANGE = (0.2, 0.7)  # (near, far) lateral half-width, meters.
 # this cone -- a direction the robot has a plausible chance of actually
 # hitting from its current orientation, rather than a fully arbitrary one.
 KICK_DIR_CONE_DEG = 80.0
+# Fraction of ball "lives" commanded as a strong kick (env.kick_strong, see
+# kick_contact_cycle) -- the rest are weak, gated by WEAK_KICK_MAX_SPEED.
+STRONG_KICK_PROB = 0.5
+# Weak-kick speed cap (m/s, ball post-kick speed) -- see
+# weak_kick_speed_penalty. Only enforced on a weak-kick life.
+WEAK_KICK_MAX_SPEED = 1.0
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
@@ -277,6 +283,10 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       func=amp_mdp.kick_dir_heading_b,
       params={"robot_cfg": SceneEntityCfg("robot")},
     ),
+    # Commanded strong/weak kick intent (env.kick_strong) -- see
+    # kick_strong_obs docstring. A task command, not a sensed quantity, so
+    # actor and critic both get the exact value, no noise/delay.
+    "kick_strong": ObservationTermCfg(func=amp_mdp.kick_strong_obs),
   }
   for grp_name in ("actor", "critic"):
     grp = cfg.observations[grp_name]
@@ -467,6 +477,20 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "min_ball_speed": 0.1,
     },
   )
+  # Strong/weak kick command (env.kick_strong, see kick_contact_cycle and
+  # kick_strong_obs). Strong-kick trials are untouched by this term -- the
+  # rewards above keep pushing for a hard, accurate strike as before. On a
+  # weak-kick trial, this adds a growing penalty once the ball goes past
+  # WEAK_KICK_MAX_SPEED, on top of the unchanged rewards above -- the robot
+  # must still strike the ball well, but must hold back on power.
+  cfg.rewards["weak_kick_speed"] = RewardTermCfg(
+    func=amp_mdp.weak_kick_speed_penalty,
+    weight=-50.0,
+    params={
+      "ball_cfg": SceneEntityCfg(BALL_NAME),
+      "max_speed": WEAK_KICK_MAX_SPEED,
+    },
+  )
   # Bumped (was -0.2): a proper side-foot kick now pays off twice over --
   # avoiding this penalty AND collecting the full kick_impact style multiplier
   # above -- while front/back or outside contact are hit by both this penalty
@@ -538,6 +562,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "dist_range": BALL_DIST_RANGE,
       "lateral_range": BALL_LATERAL_RANGE,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
+      "strong_kick_prob": STRONG_KICK_PROB,
     },
   )
   cfg.events["kick_contact_cycle"] = EventTermCfg(
@@ -560,6 +585,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
       "right_ball_sensor_name": "r_foot_ball_contact",
       "left_ball_sensor_name": "l_foot_ball_contact",
+      "strong_kick_prob": STRONG_KICK_PROB,
     },
   )
 

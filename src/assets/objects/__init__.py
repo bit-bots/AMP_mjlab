@@ -2,5 +2,7 @@ from .ball import (
   BALL_BODY_NAME as BALL_BODY_NAME,
   BALL_GEOM_NAME as BALL_GEOM_NAME,
   BALL_RADIUS as BALL_RADIUS,
+  BALL_STRONG_RGBA as BALL_STRONG_RGBA,
+  BALL_WEAK_RGBA as BALL_WEAK_RGBA,
   get_ball_cfg as get_ball_cfg,
 )

@@ -254,6 +254,25 @@ def kick_state_obs(
     return torch.stack([kicking, post_kick], dim=-1).float()
 
 
+def kick_strong_obs(
+    env: ManagerBasedRlEnv, strong_attr: str = "kick_strong"
+) -> torch.Tensor:
+    """Commanded kick intent for the current ball "life" (``env.kick_strong``,
+    set by ``kick_contact_cycle``/``_place_ball_near_robot``, mdp/events.py):
+    1.0 for a strong kick, 0.0 for a weak kick.
+
+    This is a task command, not a sensed quantity -- the actor must see the
+    exact value it is being asked to act on. It goes to both the actor and
+    critic groups with no noise, the same as a real commanded input would be.
+    ``weak_kick_speed_penalty`` (mdp/rewards.py) reads the same attribute to
+    penalize a weak-kick trial where the ball ends up too fast.
+    """
+    strong = getattr(env, strong_attr, None)
+    if strong is None:
+        return torch.zeros(env.num_envs, 1, device=env.device)
+    return strong.float().unsqueeze(-1)
+
+
 def robot_body_ang_vel_b(
     env: ManagerBasedRlEnv,
     anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),

@@ -220,8 +220,8 @@ KICK_TERRAIN_CFG = TerrainGeneratorCfg(
     "tilted_rough": GroundedTiltedGridTerrainCfg(
       proportion=1.0,
       grid_width=0.3,
-      tilt_range_deg=6.0,
-      height_range=0.045,
+      tilt_range_deg=4.5,
+      height_range=0.032,
       border_width=0.25,
       base_h=0.0,
       floor_depth=0.15,
@@ -250,7 +250,7 @@ KICK_TERRAIN_CFG = TerrainGeneratorCfg(
     ),
     "perlin_rough": terrain_gen.HfPerlinNoiseTerrainCfg(
       proportion=1.0,
-      height_range=(0.05, 0.08),
+      height_range=(0.035, 0.055),
       scale=12.0,
       octaves=3,
       resolution=0.1,

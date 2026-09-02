@@ -665,6 +665,34 @@ def post_kick_velocity_penalty(
   return torch.where(timer > 0, speed_sq, torch.zeros_like(speed_sq))
 
 
+def weak_kick_speed_penalty(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  max_speed: float = 1.0,
+  timer_attr: str = "kick_timer",
+  strong_attr: str = "kick_strong",
+) -> torch.Tensor:
+  """Penalize the ball going faster than ``max_speed`` during the post-kick
+  window (``env.kick_timer`` > 0), on a WEAK-kick trial only (``env.kick_strong``
+  false -- see ``kick_strong_obs``, mdp/observations.py).
+
+  Grows linearly past ``max_speed`` (like ``foot_base_proximity_penalty``),
+  0 at or under it, so a full miss is not required to avoid the penalty --
+  only staying under the speed cap is. A strong-kick trial is untouched:
+  ``kick_impact_reward``/``ball_kick_contact_reward``/``kick_direction_reward``
+  keep rewarding a hard, accurate strike exactly as before this term existed.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
+  excess = torch.clamp(ball_speed - max_speed, min=0.0)
+  timer = getattr(env, timer_attr, None)
+  strong = getattr(env, strong_attr, None)
+  if timer is None or strong is None:
+    return torch.zeros_like(ball_speed)
+  active = (timer > 0) & ~strong
+  return torch.where(active, excess, torch.zeros_like(excess))
+
+
 def foot_medial_alignment(
   foot_pos_xy: torch.Tensor,
   foot_quat: torch.Tensor,

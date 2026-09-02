@@ -4,9 +4,9 @@ The robot model is kept byte-identical to the smp/BeyondMimic Pi Plus port
 (``piplus.xml`` + meshes copied verbatim). For real-robot deployment the actuators
 mirror the bitbots ``mjlab_piplus`` model: ``XmlPositionActuatorCfg`` reads the XML's
 ``<position>`` gains (kp=30/50, kv=0.6/1.1, forcerange), wrapped in
-``DelayedActuatorCfg`` for a randomized 0-3 control-step (0-60 ms @ 50 Hz) actuator
-latency. (mjlab 1.2.0 splits into Xml + Delayed cfgs what mjlab_piplus's 1.3.0
-``XmlActuatorCfg`` combines.)
+``DelayedActuatorCfg`` for a randomized 0-5 physics-step (0-25 ms @ 50 Hz
+control) actuator latency. (mjlab 1.2.0 splits into Xml + Delayed cfgs what
+mjlab_piplus's 1.3.0 ``XmlActuatorCfg`` combines.)
 """
 
 from pathlib import Path
@@ -20,11 +20,10 @@ from mjlab.utils.spec_config import CollisionCfg
 from src import SRC_PATH
 
 # Actuator delay range in PHYSICS timesteps (mjlab DelayBuffer quantizes to physics
-# steps, not control steps), matching the bitbots mjlab_playground pi_plus.
-# At 5 ms physics (decimation 4 -> 50 Hz control): 12 physics steps = 60 ms = 3
-# control steps.
+# steps, not control steps). At 5 ms physics (decimation 4 -> 50 Hz control):
+# 5 physics steps = 25 ms = 1.25 control steps.
 ACTUATOR_LAG_MIN = 0
-ACTUATOR_LAG_MAX = 12
+ACTUATOR_LAG_MAX = 5
 
 ##
 # MJCF and assets.
@@ -58,9 +57,9 @@ def get_spec() -> mujoco.MjSpec:
 # bumped 35->50 for stiffer tracking
 # (arm kp=6 kv=0.6 effort=10; leg kp=50 kv=1.1; hip_roll kp=50 kv=1.4; effort=20;
 # armature from bitbots_main), built-in position servos wrapped in
-# DelayedActuatorCfg for a randomized 0-12 physics-step latency (= 0-60 ms / 0-3
-# control steps @ 50 Hz; mjlab 1.2.0's BuiltinPositionActuatorCfg has no delay
-# field, so the delay is a wrapper).
+# DelayedActuatorCfg for a randomized 0-5 physics-step latency (= 0-25 ms,
+# ~1.25 control steps @ 50 Hz; mjlab 1.2.0's BuiltinPositionActuatorCfg has no
+# delay field, so the delay is a wrapper).
 ##
 
 PIPLUS_ACTUATOR_ARM = DelayedActuatorCfg(

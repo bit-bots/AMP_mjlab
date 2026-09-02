@@ -18,6 +18,12 @@ BALL_MASS = 0.205  # kg
 # (sliding, torsional, rolling) -- condim=6 so torsional/rolling friction apply.
 BALL_FRICTION = (0.6, 0.1, 0.1)
 
+# Spawn color (a strong-kick life). kick_contact_cycle (mdp/events.py)
+# overwrites geom_rgba directly to BALL_WEAK_RGBA on a weak-kick life, so
+# the two are visually distinct in the viewer.
+BALL_STRONG_RGBA = (0.85, 0.15, 0.1, 1.0)  # red
+BALL_WEAK_RGBA = (0.15, 0.45, 0.85, 1.0)  # blue
+
 
 def _get_ball_spec() -> mujoco.MjSpec:
   spec = mujoco.MjSpec()
@@ -28,7 +34,7 @@ def _get_ball_spec() -> mujoco.MjSpec:
     type=mujoco.mjtGeom.mjGEOM_SPHERE,
     size=[BALL_RADIUS, 0.0, 0.0],
     mass=BALL_MASS,
-    rgba=[0.85, 0.15, 0.1, 1.0],
+    rgba=list(BALL_STRONG_RGBA),
   )
   geom.friction = list(BALL_FRICTION)
   geom.condim = 6
