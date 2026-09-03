@@ -748,6 +748,7 @@ def kick_impact_reward(
   height_weight: float = 1.0,
   saturation_scale: float = 5.0,
   dir_sigma: float = 0.5,
+  weak_kick_boost: float = 1.0,
 ) -> torch.Tensor:
   """Reward ball speed + height while a post-contact reward window is open,
   scaled by how well the foot was aligned with the ball at the moment of
@@ -783,6 +784,16 @@ def kick_impact_reward(
   ``kick_foot_correct`` too: a kick with the wrong foot (per the current
   ball position/target angle) shouldn't also collect this reward on top of
   ``ball_kick_contact_reward``'s penalty for the same touch.
+
+  ``weak_kick_boost`` multiplies the whole term on a weak-kick life
+  (``env.kick_strong`` false, see ``kick_contact_cycle``): a correctly
+  executed weak kick is deliberately slower than a strong one (capped by
+  ``weak_kick_speed_penalty``), so at ``weak_kick_boost=1.0`` it earns much
+  less here purely from lower speed -- the policy learned to just skip
+  attempting weak kicks rather than take a real ball-approach risk for a
+  small reward. Boosting compensates so a well-placed weak kick is worth
+  roughly as much as a well-placed strong one, without changing the speed
+  cap that makes it "weak". 1.0 on a strong-kick life (no change).
   """
   ball: Entity = env.scene[ball_cfg.name]
   timer = getattr(env, "kick_timer", None)
@@ -806,7 +817,13 @@ def kick_impact_reward(
     if kick_dir is None
     else _kick_dir_factor(ball_vel_xy, kick_dir, dir_sigma)
   )
-  return torch.where(active, style * bounded * dir_factor, torch.zeros_like(ball_speed))
+  strong = getattr(env, "kick_strong", None)
+  boost = (
+    torch.ones_like(ball_speed)
+    if strong is None
+    else torch.where(strong, torch.ones_like(ball_speed), torch.full_like(ball_speed, weak_kick_boost))
+  )
+  return torch.where(active, style * bounded * dir_factor * boost, torch.zeros_like(ball_speed))
 
 
 def kick_direction_reward(

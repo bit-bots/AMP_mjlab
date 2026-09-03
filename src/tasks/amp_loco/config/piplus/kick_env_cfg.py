@@ -119,6 +119,13 @@ STRONG_KICK_PROB = 0.5
 # Weak-kick speed cap (m/s, ball post-kick speed) -- see
 # weak_kick_speed_penalty. Only enforced on a weak-kick life.
 WEAK_KICK_MAX_SPEED = 2.0
+# kick_impact_reward multiplier on a weak-kick life -- a correctly executed
+# weak kick is deliberately slower, so at 1.0 it earns much less than a
+# strong kick purely from lower speed, and the policy learned to skip
+# attempting weak kicks rather than risk the approach for little reward.
+# ~2.5 roughly equalizes a good soft kick's reward with a good hard kick's,
+# given this task's saturation_scale/vel_weight/height_weight below.
+WEAK_KICK_IMPACT_BOOST = 2.5
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
@@ -462,6 +469,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "height_weight": 5.0,
       "saturation_scale": 5.0,
       "dir_sigma": KICK_DIR_SIGMA_START,
+      "weak_kick_boost": WEAK_KICK_IMPACT_BOOST,
     },
   )
   # Rewards/penalizes the ball's post-kick direction against a randomly
