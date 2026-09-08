@@ -114,31 +114,41 @@ PIPLUS_ACTUATOR_LEG = DelayedActuatorCfg(
 )
 
 ##
-# Keyframe (dataset-mean pose from the smp port; per-joint, not L/R symmetric).
+# Keyframe (dataset-mean pose over WalkandRun -- 10 CMU walk clips + their
+# mirrors + the 2 unpaired LAFAN1 run/walk clips, 44503 frames total;
+# per-joint, not L/R symmetric). Regenerated after fixing two retargeting
+# bugs: GMR's identical left/right arm offset_quat (made the right arm track
+# a genuinely wrong target) and cmu_bvh.py's uncalibratable T-pose twist on
+# the left arm chain (see general_motion_retargeting git history on
+# piplus-gmr-fixes). Not directly comparable to bitbots_main's static
+# walkready pose -- the two unpaired LAFAN1 clips are long, dynamic
+# running/walking gaits (run1_subject2 alone is 7135 of the 44503 frames),
+# so their swinging-arm mean dominates over the more walkready-like CMU
+# clips' paired (and therefore exactly antisymmetric) contribution.
 ##
 
 HOME_KEYFRAME = EntityCfg.InitialStateCfg(
-  pos=(0, 0, 0.3413),
+  pos=(0, 0, 0.3558),
   joint_pos={
-    "r_shoulder_pitch_joint": 1.2902,
-    "r_shoulder_roll_joint": 1.1479,
-    "r_upper_arm_joint": -0.1694,
-    "r_elbow_joint": 1.8082,
-    "l_shoulder_pitch_joint": -1.3218,
-    "l_shoulder_roll_joint": -1.0850,
-    "l_upper_arm_joint": 0.1584,
-    "l_elbow_joint": -1.9507,
-    "r_hip_pitch_joint": 0.6691,
-    "r_hip_roll_joint": -0.1417,
-    "r_thigh_joint": 0.1645,
-    "r_calf_joint": 1.0644,
-    "r_ankle_pitch_joint": 0.1619,
+    "r_shoulder_pitch_joint": -1.3438,
+    "r_shoulder_roll_joint": -1.0446,
+    "r_upper_arm_joint": -0.4940,
+    "r_elbow_joint": -0.9728,
+    "l_shoulder_pitch_joint": -0.2340,
+    "l_shoulder_roll_joint": 0.0144,
+    "l_upper_arm_joint": 0.3343,
+    "l_elbow_joint": -0.3752,
+    "r_hip_pitch_joint": 0.4920,
+    "r_hip_roll_joint": -0.1105,
+    "r_thigh_joint": 0.1501,
+    "r_calf_joint": 0.6298,
+    "r_ankle_pitch_joint": 0.1736,
     "r_ankle_roll_joint": 0.0000,
-    "l_hip_pitch_joint": -0.6540,
-    "l_hip_roll_joint": 0.1116,
-    "l_thigh_joint": -0.1363,
-    "l_calf_joint": -1.0866,
-    "l_ankle_pitch_joint": -0.1045,
+    "l_hip_pitch_joint": -0.5022,
+    "l_hip_roll_joint": 0.0820,
+    "l_thigh_joint": -0.0953,
+    "l_calf_joint": -0.6316,
+    "l_ankle_pitch_joint": -0.1359,
     "l_ankle_roll_joint": 0.0000,
   },
   joint_vel={".*": 0.0},
