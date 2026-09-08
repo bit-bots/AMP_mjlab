@@ -76,10 +76,26 @@ def track_anchor_linear_velocity(
   delay_env_rew_ratio: float = 1.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+  std_scale: float | None = None,
+  std_min: float = 0.15,
 ) -> torch.Tensor:
   """Reward for tracking the commanded anchor linear velocity.
 
   The commanded z velocity is assumed to be zero.
+
+  A flat ``std`` (exp(-error^2/std^2)) saturates near 1.0 once tracking is
+  "good enough" relative to std, leaving little gradient to keep improving --
+  and gives the SAME absolute tolerance regardless of how fast the command
+  is, so a slow/near-zero command is trivially "satisfied" without precise
+  tracking. If ``std_scale`` is set, this switches to an effective std that
+  scales with the commanded speed instead: ``eff_std = max(std_scale *
+  |command_xy|, std_min)``, demanding proportionally tighter tracking at low
+  commanded speeds than at high ones, while ``std_min`` floors it so a
+  literally-zero command doesn't require unachievable exact stillness.
+  ``std_scale`` is meant to be annealed down over training (see
+  ``anneal_reward_param_linear``) to keep restoring gradient as the flat-std
+  reward would otherwise saturate. When ``std_scale`` is None, behavior is
+  unchanged (flat ``std``), so existing configs (e.g. G1) are unaffected.
   """
   asset: Entity = env.scene[asset_cfg.name]
   command = env.command_manager.get_command(command_name)
@@ -91,7 +107,12 @@ def track_anchor_linear_velocity(
     command_xyz_b,
   )
   lin_vel_error = torch.sum(torch.square(command_xyz_w[:,:3] - asset.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :3]), dim=1)
-  reward = torch.exp(-lin_vel_error / std**2)
+  if std_scale is not None:
+    command_speed = torch.norm(command[:, :2], dim=-1)
+    eff_std = torch.clamp(std_scale * command_speed, min=std_min)
+  else:
+    eff_std = std
+  reward = torch.exp(-lin_vel_error / eff_std**2)
   return _apply_delay_env_reward_scaling(env, reward, mask_delay, delay_env_rew_ratio)
 
 
@@ -103,10 +124,20 @@ def track_anchor_angular_velocity(
   delay_env_rew_ratio: float = 1.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+  std_scale: float | None = None,
+  std_min: float = 0.15,
 ) -> torch.Tensor:
   """Reward heading error for heading-controlled envs, angular velocity for others.
 
   The commanded xy angular velocities are assumed to be zero.
+
+  Same command-magnitude-scaled tolerance as ``track_anchor_linear_velocity``
+  (see its docstring): if ``std_scale`` is set, ``eff_std = max(std_scale *
+  |command_yaw_rate|, std_min)`` instead of a flat ``std``, so low-yaw-rate
+  commands demand proportionally tighter tracking than high ones, and the
+  reward keeps gradient instead of saturating once "good enough" at a fixed
+  tolerance. ``std_scale`` is meant to be annealed down over training. When
+  ``std_scale`` is None, behavior is unchanged (flat ``std``).
   """
   asset: Entity = env.scene[asset_cfg.name]
   command = env.command_manager.get_command(command_name)
@@ -125,7 +156,11 @@ def track_anchor_angular_velocity(
 
   total_error = ang_vel_z_error + ang_vel_xy_error
 
-  reward = torch.exp(-total_error / std**2)
+  if std_scale is not None:
+    eff_std = torch.clamp(std_scale * torch.abs(command_ang_vel_w), min=std_min)
+  else:
+    eff_std = std
+  reward = torch.exp(-total_error / eff_std**2)
   return _apply_delay_env_reward_scaling(env, reward, mask_delay, delay_env_rew_ratio)
 
 def body_ang_vel_xy_l2(
@@ -244,5 +279,94 @@ def self_collision_cost(
     return hit.sum(dim=-1).float()  # [B]
   assert data.found is not None
   return data.found.squeeze(-1)
+
+
+def accel_toward_command_reward(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  close_speed: float = 0.15,
+  close_bonus: float = 0.08,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+) -> torch.Tensor:
+  """Reward accelerating TOWARD the commanded velocity, to fix a dead zone in
+  ``track_anchor_linear_velocity``: its exp(-error^2/std^2) shape has near-zero
+  gradient both very close to AND very far from the target -- so right after
+  an aggressive command switch, the robot lands in the far-zero zone where
+  "stand still" and "half-heartedly try" score almost the same, and standing
+  is lower-risk (avoids the large is_terminated penalty), so that's what gets
+  learned.
+
+  SIGNED and symmetric: accelerating toward the command gives positive reward,
+  accelerating away gives a matching PENALTY (not just zero) -- computed as
+  the dot product of this step's velocity change with the unit vector from
+  current velocity to the command, so it has real gradient everywhere, unlike
+  the tracking reward's exp shape.
+
+  Anti-farming: that raw dot product is only well-defined, and only worth
+  paying out, while genuinely far from the target -- near it, the direction
+  vector gets noisy and a policy could farm small aligned jitters for
+  repeated reward instead of settling. Below ``close_speed`` error, this
+  returns a flat ``close_bonus`` (deliberately >= the typical far-zone peak)
+  regardless of the actual acceleration, so holding still and accurate is
+  already at least as good as any jitter -- removing the incentive to keep
+  moving once close.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None, f"Command '{command_name}' not found."
+
+  command_xyz_b = torch.cat((command[:, :2], torch.zeros_like(command[:, :1])), dim=-1)
+  command_xyz_w = quat_apply(
+    yaw_quat(asset.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]),
+    command_xyz_b,
+  )
+  cur_vel = asset.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :3]
+
+  prev_vel = getattr(env, "_accel_reward_prev_vel", None)
+  if prev_vel is None or prev_vel.shape != cur_vel.shape:
+    prev_vel = cur_vel.clone()
+  # First step of a fresh episode: last step's velocity belonged to the
+  # PREVIOUS episode (or env construction) -- treat as no acceleration yet
+  # rather than measuring a bogus reset-induced spike.
+  just_reset = env.episode_length_buf == 0
+  prev_vel = torch.where(just_reset.unsqueeze(-1), cur_vel, prev_vel)
+
+  delta_v = cur_vel - prev_vel
+  env._accel_reward_prev_vel = cur_vel.detach().clone()
+
+  error_vec = command_xyz_w - cur_vel
+  error_mag = torch.norm(error_vec, dim=-1)
+  error_dir = error_vec / torch.clamp(error_mag, min=1e-6).unsqueeze(-1)
+
+  far_reward = torch.sum(delta_v * error_dir, dim=-1)
+  is_close = error_mag < close_speed
+  return torch.where(is_close, torch.full_like(far_reward, close_bonus), far_reward)
+
+
+def contact_sensor_touched(sensor: ContactSensor, force_threshold: float = 0.1) -> torch.Tensor:
+  """Whether a contact registered at ANY substep within the current control
+  step, not just the final one ``found`` samples -- a fast strike-and-
+  separate can happen entirely within one step's decimation loop and be
+  invisible to ``found`` alone (confirmed empirically on the kick task: ball
+  visibly moves, ``found`` never shows touching that step).
+
+  Uses ``force_history`` (populated when the sensor's ``fields`` includes
+  "force" and ``history_length`` is set to at least the sim's decimation --
+  see ``ContactSensorCfg``'s docstring) if available, falling back to plain
+  ``found`` otherwise. Same fix ``self_collision_cost`` above already applies
+  for its own force-magnitude count; this is the boolean-touch equivalent for
+  any other contact check that currently only reads ``found`` (e.g.
+  ``feet_slip``, ``soft_landing``) -- not wired into either of those here,
+  since that would change this task's already-tuned reward behavior without
+  being asked, but the fix is a drop-in swap if the same failure mode shows
+  up in training.
+  """
+  data = sensor.data
+  if data.force_history is not None:
+    force_mag = torch.norm(data.force_history, dim=-1)  # [B, N, H]
+    return (force_mag > force_threshold).any(dim=(1, 2))
+  assert data.found is not None
+  return (data.found > 0).any(dim=-1)
 
 

@@ -2,6 +2,7 @@
 
 import os
 import inspect
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -214,6 +215,25 @@ def run_play(task_id: str, cfg: PlayConfig):
       "[WARN] Video recording with dummy agents is disabled (no checkpoint/log_dir)."
     )
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+
+  # Sync env.common_step_counter to the loaded checkpoint's training
+  # iteration (parsed from its filename, e.g. "model_14000.pt" -> 14000).
+  # Any curriculum keyed off this counter (terrain difficulty ramps,
+  # reward-weight fades, tolerance annealing, termination gating -- see
+  # mdp/curriculums.py) otherwise starts from a fresh env's counter of 0,
+  # showing early-training behavior no matter which checkpoint was actually
+  # loaded. Forces a reset right after so the curricula recompute against
+  # the synced counter before the viewer runs.
+  if TRAINED_MODE and resume_path is not None:
+    iter_match = re.search(r"(\d+)", resume_path.stem)
+    if iter_match is not None:
+      iteration = int(iter_match.group(1))
+      env.common_step_counter = iteration * agent_cfg.num_steps_per_env
+      env.reset()
+      print(
+        f"[INFO]: Synced curriculum state to checkpoint iteration {iteration} "
+        f"(common_step_counter={env.common_step_counter})"
+      )
 
   if TRAINED_MODE and cfg.video:
     print("[INFO] Recording videos during play")

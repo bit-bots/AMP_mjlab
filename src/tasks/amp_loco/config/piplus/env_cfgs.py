@@ -2,6 +2,7 @@
 
 import copy
 import os
+from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
@@ -13,11 +14,17 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.utils.noise import GaussianNoiseCfg, UniformNoiseCfg as Unoise
 
 from src.assets.robots import PIPLUS_ACTION_SCALE, get_piplus_robot_cfg
 from src.tasks.amp_loco import mdp as amp_mdp
 from src.tasks.amp_loco.amp_env_cfg import make_amp_env_cfg
+from src.tasks.amp_loco.mdp.terrain import (
+  WALK_TERRAIN_CFG,
+  WALK_TERRAIN_FLAT_COLS,
+  WALK_TERRAIN_NONFLAT_COLS,
+)
 
 # --- Pi Plus name mapping ---------------------------------------------------
 ANCHOR_NAME = "torso_link"
@@ -215,6 +222,18 @@ def piplus_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   return cfg
 
 
+# The "not learning" symptom investigated at length turned out to be a missing
+# --env.scene.num-envs 4096 launch flag (every diagnostic run today silently used
+# the num_envs=1 default), not terrain or motions -- both are back on.
+_ENABLE_KICK_TERRAIN = True
+# Off for now: the anneal narrowed std_scale down to 0.2 by iteration 15000,
+# which combined with a 0.6 starting point made large-velocity commands too
+# tightly toleranced too early. Widened std_scale (below) and held fixed
+# (no decay) until tracking at the wider tolerance is validated -- flip back
+# on to revisit narrowing later.
+_ENABLE_STD_ANNEAL = False
+
+
 def piplus_amp_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = piplus_amp_rough_env_cfg(play=play)
 
@@ -223,16 +242,103 @@ def piplus_amp_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.sim.contact_sensor_maxmatch = 256
   cfg.sim.nconmax = None
 
+  # Kick-style terrain: flat/tilted-grid/Perlin mix (mdp/terrain.py), ramped via
+  # the step-based terrain_flat_fraction_curriculum below -- exactly kick's
+  # recipe, since kick also builds on this flat cfg. Deliberately NOT under
+  # piplus_amp_rough_env_cfg: that variant's height_scan raycast sensor has
+  # never been exercised against this mesh-heavy terrain (kick never has
+  # height_scan either, having derived from this same flat cfg, which already
+  # strips it below) and PiPlus-AMP-Rough itself has no prior successful
+  # training run to build on, unlike this flat cfg.
   assert cfg.scene.terrain is not None
-  cfg.scene.terrain.terrain_type = "plane"
-  cfg.scene.terrain.terrain_generator = None
+  if _ENABLE_KICK_TERRAIN:
+    cfg.scene.terrain.terrain_type = "generator"
+    cfg.scene.terrain.terrain_generator = replace(WALK_TERRAIN_CFG)
+    cfg.scene.terrain.max_init_terrain_level = None
+  else:
+    cfg.scene.terrain.terrain_type = "plane"
+    cfg.scene.terrain.terrain_generator = None
 
   cfg.scene.sensors = tuple(
     s for s in (cfg.scene.sensors or ()) if s.name != "terrain_scan"
   )
   del cfg.observations["actor"].terms["height_scan"]
   del cfg.observations["critic"].terms["height_scan"]
+  # Velocity-tracking reward: switch from a flat std (saturates near max
+  # reward once "good enough", leaving little gradient to keep improving, and
+  # gives slow/near-zero commands the SAME absolute tolerance as fast ones)
+  # to a std that scales with commanded speed, floored at std_min so a
+  # literally-zero command doesn't demand unachievable exact stillness. This
+  # already demands proportionally tighter tracking at low speed than high
+  # from the start; annealing std_scale down over training (below) restores
+  # gradient across the whole speed range as the initial tolerance is met.
+  cfg.rewards["track_anchor_linear_velocity"].params["std_scale"] = 1.0
+  cfg.rewards["track_anchor_linear_velocity"].params["std_min"] = 0.15
+
+  # Bootstraps the far-from-target regime the tracking reward above can't see
+  # (exp shape has ~no gradient there) -- see accel_toward_command_reward's
+  # docstring. Small weight relative to tracking: this is meant to nudge the
+  # policy to keep trying after an aggressive command switch, not compete
+  # with steady-state tracking once it's already close.
+  cfg.rewards["accel_toward_command"] = RewardTermCfg(
+    func=amp_mdp.accel_toward_command_reward,
+    weight=0.3,
+    params={
+      "command_name": "twist",
+      "close_speed": 0.15,
+      "close_bonus": 0.08,
+      "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
+    },
+  )
+
+  if _ENABLE_STD_ANNEAL:
+    cfg.curriculum["anneal_velocity_tracking_std"] = CurriculumTermCfg(
+      func=amp_mdp.anneal_reward_param_linear,
+      params={
+        "reward_name": "track_anchor_linear_velocity",
+        "param_name": "std_scale",
+        "start_step": 2000 * 24,
+        "end_step": 15000 * 24,
+        "start_value": 1.0,
+        "end_value": 0.2,
+      },
+    )
+  else:
+    cfg.curriculum.pop("anneal_velocity_tracking_std", None)
+
+  # Same command-magnitude-scaled tolerance as the linear-velocity reward
+  # above, applied to yaw-rate tracking.
+  cfg.rewards["track_anchor_angular_velocity"].params["std_scale"] = 1.0
+  cfg.rewards["track_anchor_angular_velocity"].params["std_min"] = 0.15
+  if _ENABLE_STD_ANNEAL:
+    cfg.curriculum["anneal_yaw_tracking_std"] = CurriculumTermCfg(
+      func=amp_mdp.anneal_reward_param_linear,
+      params={
+        "reward_name": "track_anchor_angular_velocity",
+        "param_name": "std_scale",
+        "start_step": 2000 * 24,
+        "end_step": 15000 * 24,
+        "start_value": 1.0,
+        "end_value": 0.2,
+      },
+    )
+  else:
+    cfg.curriculum.pop("anneal_yaw_tracking_std", None)
+
   cfg.curriculum.pop("terrain_levels", None)
+  if _ENABLE_KICK_TERRAIN:
+    cfg.curriculum["terrain_nonflat_fraction"] = CurriculumTermCfg(
+      func=amp_mdp.terrain_flat_fraction_curriculum,
+      params={
+        "flat_cols": WALK_TERRAIN_FLAT_COLS,
+        "nonflat_cols": WALK_TERRAIN_NONFLAT_COLS,
+        "start_nonflat_frac": 0.1,
+        "end_nonflat_frac": 2.0 / 3.0,
+        "end_step": 12000 * 24,
+      },
+    )
+  else:
+    cfg.curriculum.pop("terrain_nonflat_fraction", None)
 
   if play:
     twist_cmd = cfg.commands["twist"]
@@ -240,5 +346,14 @@ def piplus_amp_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist_cmd.ranges.lin_vel_x = (-1.0, 2.0)
     twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
     twist_cmd.ranges.ang_vel_z = (-3.14 / 2, 3.14 / 2)
+    if _ENABLE_KICK_TERRAIN:
+      cfg.curriculum = {}
+      cfg.events["randomize_terrain"] = EventTermCfg(
+        func=envs_mdp.randomize_terrain, mode="reset", params={}
+      )
+      cfg.scene.terrain.terrain_generator.curriculum = False
+      cfg.scene.terrain.terrain_generator.num_cols = 5
+      cfg.scene.terrain.terrain_generator.num_rows = 5
+      cfg.scene.terrain.terrain_generator.border_width = 10.0
 
   return cfg

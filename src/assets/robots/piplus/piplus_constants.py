@@ -20,11 +20,10 @@ from mjlab.utils.spec_config import CollisionCfg
 from src import SRC_PATH
 
 # Actuator delay range in PHYSICS timesteps (mjlab DelayBuffer quantizes to physics
-# steps, not control steps), matching the bitbots mjlab_playground pi_plus.
-# At 5 ms physics (decimation 4 -> 50 Hz control): 12 physics steps = 60 ms = 3
-# control steps.
+# steps, not control steps). At 5 ms physics (decimation 4 -> 50 Hz control):
+# 5 physics steps = 25 ms = 1.25 control steps.
 ACTUATOR_LAG_MIN = 0
-ACTUATOR_LAG_MAX = 12
+ACTUATOR_LAG_MAX = 5
 
 ##
 # MJCF and assets.
