@@ -267,6 +267,11 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       },
     ),
+    # Ball velocity: critic (value function) only, popped from the actor
+    # below. The real robot has no direct way to sense the ball's velocity
+    # (no privileged simulator state), so the policy shouldn't get to
+    # condition on it -- the critic keeps it as privileged ground truth for a
+    # better value estimate, standard asymmetric actor-critic.
     "ball_lin_vel_b": ObservationTermCfg(
       func=amp_mdp.object_lin_vel_b,
       params={
@@ -303,7 +308,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # adding actor-only noise below would leak into the critic's ground truth.
     for name, term in ball_obs_terms.items():
       grp.terms[name] = copy.copy(term)
-  # kick_state is critic-only -- see its dict entry above.
+  # ball_lin_vel_b and kick_state are critic-only -- see their dict entries above.
+  cfg.observations["actor"].terms.pop("ball_lin_vel_b", None)
   cfg.observations["actor"].terms.pop("kick_state", None)
 
   # Actor-only ball position noise (critic keeps ground truth): models a noisy
