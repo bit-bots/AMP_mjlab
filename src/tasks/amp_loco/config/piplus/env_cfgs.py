@@ -147,6 +147,10 @@ def piplus_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   cfg.rewards["track_anchor_linear_velocity"].params["anchor_cfg"].body_names = (ANCHOR_NAME,)
   cfg.rewards["track_anchor_angular_velocity"].params["anchor_cfg"].body_names = (ANCHOR_NAME,)
+  # Bumped from the shared base's weight=1.0: the walk policy was tracking
+  # commands loosely, prioritize matching the commanded twist more strongly.
+  cfg.rewards["track_anchor_linear_velocity"].weight = 2.0
+  cfg.rewards["track_anchor_angular_velocity"].weight = 2.0
   cfg.rewards["foot_slip"].params["asset_cfg"].site_names = SITE_NAMES
   cfg.rewards["self_collisions"] = RewardTermCfg(
     func=mdp.self_collision_cost,
