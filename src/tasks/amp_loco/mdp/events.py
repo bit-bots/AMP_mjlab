@@ -328,7 +328,6 @@ def _place_ball_near_robot(
     dist_range: tuple[float, float],
     lateral_range: tuple[float, float],
     kick_dir_cone_deg: float,
-    strong_kick_prob: float = 0.5,
 ) -> None:
     n = env_ids.shape[0]
     robot_xy = robot.data.root_link_pos_w[env_ids, :2]
@@ -388,11 +387,12 @@ def _place_ball_near_robot(
         env.kick_dir_world[env_ids] = _sample_kick_dir(
             n, env.device, heading=robot_yaw, cone_deg=kick_dir_cone_deg
         )
-    # ...and a fresh strong/weak kick intent for this life (kick_strong_obs,
-    # mdp/observations.py; weak_kick_speed_penalty, mdp/rewards.py).
-    if hasattr(env, "kick_strong"):
-        env.kick_strong[env_ids] = sample_uniform(0.0, 1.0, (n,), device=env.device) < strong_kick_prob
-        # Color the ball by the new intent (BALL_STRONG_RGBA/BALL_WEAK_RGBA,
+    # ...and a fresh commanded kick intensity for this life (kick_intensity_obs,
+    # mdp/observations.py; kick_speed_cap_penalty/kick_impact_reward, mdp/rewards.py).
+    if hasattr(env, "kick_intensity"):
+        env.kick_intensity[env_ids] = sample_uniform(0.0, 1.0, (n,), device=env.device)
+        # Color the ball by the new intent (linearly interpolated between
+        # BALL_WEAK_RGBA at intensity=0 and BALL_STRONG_RGBA at intensity=1,
         # src/assets/objects/ball.py) -- a direct visual cue in the viewer,
         # not only in the observation. Written straight to the model field
         # (like the DR functions do for radius/friction) since this is a
@@ -400,10 +400,8 @@ def _place_ball_near_robot(
         ball_geom_id = ball.indexing.geom_ids[0]
         strong_rgba = torch.tensor(BALL_STRONG_RGBA, device=env.device)
         weak_rgba = torch.tensor(BALL_WEAK_RGBA, device=env.device)
-        is_strong = env.kick_strong[env_ids].unsqueeze(-1)
-        env.sim.model.geom_rgba[env_ids, ball_geom_id] = torch.where(
-            is_strong, strong_rgba, weak_rgba
-        )
+        t = env.kick_intensity[env_ids].unsqueeze(-1)
+        env.sim.model.geom_rgba[env_ids, ball_geom_id] = weak_rgba + t * (strong_rgba - weak_rgba)
 
 
 def reset_ball_near_robot(
@@ -414,7 +412,6 @@ def reset_ball_near_robot(
     dist_range: tuple[float, float] = (0.3, 1.0),
     lateral_range: tuple[float, float] = (0.2, 0.7),
     kick_dir_cone_deg: float = 80.0,
-    strong_kick_prob: float = 0.5,
 ) -> None:
     """Reset event: spawn the ball in front of the robot (forward distance +
     distance-scaled lateral offset, see ``_place_ball_near_robot``).
@@ -433,9 +430,7 @@ def reset_ball_near_robot(
     env.sim.forward()
     robot: Entity = env.scene[robot_cfg.name]
     ball: Entity = env.scene[ball_cfg.name]
-    _place_ball_near_robot(
-        env, env_ids, robot, ball, dist_range, lateral_range, kick_dir_cone_deg, strong_kick_prob
-    )
+    _place_ball_near_robot(env, env_ids, robot, ball, dist_range, lateral_range, kick_dir_cone_deg)
     if hasattr(env, "kick_timer"):
         env.kick_timer[env_ids] = 0
     if hasattr(env, "kick_style"):
@@ -478,13 +473,16 @@ class kick_contact_cycle:
     ``kick_impact_reward`` (mdp/rewards.py), which reads them to gate/scale
     the ball speed+height reward; this event owns writing both.
 
-    Also owns ``env.kick_strong``: a per-life commanded flag (true = strong
-    kick, false = weak kick), resampled by ``_place_ball_near_robot`` every
-    time the ball is repositioned (``strong_kick_prob`` chance of true). A
-    strong-kick life keeps the existing reward behavior unchanged. A
-    weak-kick life additionally penalizes the ball for exceeding a speed cap
-    (``weak_kick_speed_penalty``, mdp/rewards.py). The policy sees the
-    current value via ``kick_strong_obs`` (mdp/observations.py).
+    Also owns ``env.kick_intensity``: a per-life commanded intensity in
+    [0, 1], resampled uniformly by ``_place_ball_near_robot`` every time the
+    ball is repositioned, and mapped to a target ball speed by
+    ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- continuously from
+    a soft 1 m/s tap at 0.0 through a 4 m/s kick at 0.5 to an unbounded,
+    as-hard-as-possible kick at 1.0. Every life is penalized for exceeding
+    its own target speed (``kick_speed_cap_penalty``, mdp/rewards.py) --
+    inert at intensity=1 since the target speed there is astronomically
+    high. The policy sees the current value via ``kick_intensity_obs``
+    (mdp/observations.py).
 
     Also computes, at the same moment: ``env.kick_new_contact`` (a
     transient, this-event-round-only flag -- overwritten every call, not
@@ -514,7 +512,6 @@ class kick_contact_cycle:
         self._dist_range = cfg.params.get("dist_range", (0.3, 1.0))
         self._lateral_range = cfg.params.get("lateral_range", (0.2, 0.7))
         self._kick_dir_cone_deg = cfg.params.get("kick_dir_cone_deg", 80.0)
-        self._strong_kick_prob = cfg.params.get("strong_kick_prob", 0.5)
         anchor_body_name = cfg.params.get("anchor_body_name", "torso_link")
         self._anchor_body_id = self._robot.find_bodies(anchor_body_name)[0][0]
         self._angle_threshold_deg = cfg.params.get("angle_threshold_deg", 20.0)
@@ -527,14 +524,12 @@ class kick_contact_cycle:
         env.kick_new_contact = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env.kick_foot_correct = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env.kick_dir_world = _sample_kick_dir(env.num_envs, env.device)
-        env.kick_strong = (
-            sample_uniform(0.0, 1.0, (env.num_envs,), device=env.device) < self._strong_kick_prob
-        )
+        env.kick_intensity = sample_uniform(0.0, 1.0, (env.num_envs,), device=env.device)
 
     def reset(self, env_ids) -> None:
         """No-op: this event has no instance state of its own that needs
-        clearing (kick_timer/kick_style/kick_dir_world/kick_strong all live
-        on ``env`` and are cleared/reset by ``_place_ball_near_robot``
+        clearing (kick_timer/kick_style/kick_dir_world/kick_intensity all
+        live on ``env`` and are cleared/reset by ``_place_ball_near_robot``
         whenever the ball is repositioned). Required anyway -- EventManager
         only adds a
         class-based term to its debug_vis registry when it also defines
@@ -549,9 +544,9 @@ class kick_contact_cycle:
         class-based event term that defines this method -- no extra cfg flag
         needed.
 
-        Colored by ``env.kick_strong`` (red = strong, blue = weak -- same
-        colors as BALL_STRONG_RGBA/BALL_WEAK_RGBA). This is the visual
-        strong/weak cue instead of recoloring the ball geom itself: mjlab's
+        Colored by ``env.kick_intensity`` (linearly interpolated between
+        BALL_WEAK_RGBA at 0 and BALL_STRONG_RGBA at 1). This is the visual
+        intensity cue instead of recoloring the ball geom itself: mjlab's
         viser viewer bakes a dynamic mesh's color in at construction and has
         no runtime color update for it (see mjlab/viewer/viser/scene.py's
         add_batched_meshes_trimesh docstring), but debug-vis primitives like
@@ -567,7 +562,10 @@ class kick_contact_cycle:
             end = start.clone()
             end[0] = start[0] + kick_dir[env_idx, 0] * length
             end[1] = start[1] + kick_dir[env_idx, 1] * length
-            color = BALL_STRONG_RGBA if env.kick_strong[env_idx] else BALL_WEAK_RGBA
+            t = float(env.kick_intensity[env_idx])
+            color = tuple(
+                w + t * (s - w) for w, s in zip(BALL_WEAK_RGBA, BALL_STRONG_RGBA)
+            )
             visualizer.add_arrow(start, end, color=color, width=0.015, label="kick_dir")
 
     def __call__(
@@ -587,13 +585,11 @@ class kick_contact_cycle:
         angle_threshold_deg: float = 20.0,
         right_ball_sensor_name: str = "r_foot_ball_contact",
         left_ball_sensor_name: str = "l_foot_ball_contact",
-        strong_kick_prob: float = 0.5,
     ) -> None:
         del (
             env_ids, robot_cfg, ball_cfg, foot_body_names, medial_signs,
             impact_speed_threshold, window_s, dist_range, lateral_range, kick_dir_cone_deg,
             anchor_body_name, angle_threshold_deg, right_ball_sensor_name, left_ball_sensor_name,
-            strong_kick_prob,
         )
         # All params unused here; resolved once in __init__.
 
@@ -669,5 +665,4 @@ class kick_contact_cycle:
         _place_ball_near_robot(
             env, ids, self._robot, self._ball,
             self._dist_range, self._lateral_range, self._kick_dir_cone_deg,
-            self._strong_kick_prob,
         )

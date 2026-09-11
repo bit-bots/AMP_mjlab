@@ -113,19 +113,16 @@ BALL_LATERAL_RANGE = (0.2, 0.7)  # (near, far) lateral half-width, meters.
 # this cone -- a direction the robot has a plausible chance of actually
 # hitting from its current orientation, rather than a fully arbitrary one.
 KICK_DIR_CONE_DEG = 80.0
-# Fraction of ball "lives" commanded as a strong kick (env.kick_strong, see
-# kick_contact_cycle) -- the rest are weak, gated by WEAK_KICK_MAX_SPEED.
-STRONG_KICK_PROB = 0.5
-# Weak-kick speed cap (m/s, ball post-kick speed) -- see
-# weak_kick_speed_penalty. Only enforced on a weak-kick life.
-WEAK_KICK_MAX_SPEED = 2.0
-# kick_impact_reward multiplier on a weak-kick life -- a correctly executed
-# weak kick is deliberately slower, so at 1.0 it earns much less than a
-# strong kick purely from lower speed, and the policy learned to skip
-# attempting weak kicks rather than risk the approach for little reward.
-# ~2.5 roughly equalizes a good soft kick's reward with a good hard kick's,
-# given this task's saturation_scale/vel_weight/height_weight below.
-WEAK_KICK_IMPACT_BOOST = 2.5
+# Kick intensity (env.kick_intensity, see kick_contact_cycle) is now a
+# continuous command in [0, 1], resampled uniformly for every ball "life" and
+# mapped to a target ball speed by kick_intensity_to_target_speed
+# (mdp/rewards.py): 0.0 -> 1 m/s, 0.5 -> 4 m/s, 1.0 -> unbounded ("as hard as
+# possible", no speed cap at all). Every life is penalized for exceeding its
+# own target speed (kick_speed_cap_penalty), and kick_impact_reward boosts a
+# low-intensity kick's reward to compensate for its inherently lower speed --
+# both computed from intensity directly now, no separate constants to tune
+# (previously STRONG_KICK_PROB/WEAK_KICK_MAX_SPEED/WEAK_KICK_IMPACT_BOOST
+# implemented a hand-tuned binary version of this).
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
@@ -295,10 +292,10 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       func=amp_mdp.kick_dir_heading_b,
       params={"robot_cfg": SceneEntityCfg("robot")},
     ),
-    # Commanded strong/weak kick intent (env.kick_strong) -- see
-    # kick_strong_obs docstring. A task command, not a sensed quantity, so
+    # Commanded kick intensity in [0, 1] (env.kick_intensity) -- see
+    # kick_intensity_obs docstring. A task command, not a sensed quantity, so
     # actor and critic both get the exact value, no noise/delay.
-    "kick_strong": ObservationTermCfg(func=amp_mdp.kick_strong_obs),
+    "kick_intensity": ObservationTermCfg(func=amp_mdp.kick_intensity_obs),
   }
   for grp_name in ("actor", "critic"):
     grp = cfg.observations[grp_name]
@@ -475,7 +472,6 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "height_weight": 5.0,
       "saturation_scale": 5.0,
       "dir_sigma": KICK_DIR_SIGMA_START,
-      "weak_kick_boost": WEAK_KICK_IMPACT_BOOST,
     },
   )
   # Rewards/penalizes the ball's post-kick direction against a randomly
@@ -491,18 +487,18 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "min_ball_speed": 0.1,
     },
   )
-  # Strong/weak kick command (env.kick_strong, see kick_contact_cycle and
-  # kick_strong_obs). Strong-kick trials are untouched by this term -- the
-  # rewards above keep pushing for a hard, accurate strike as before. On a
-  # weak-kick trial, this adds a growing penalty once the ball goes past
-  # WEAK_KICK_MAX_SPEED, on top of the unchanged rewards above -- the robot
-  # must still strike the ball well, but must hold back on power.
-  cfg.rewards["weak_kick_speed"] = RewardTermCfg(
-    func=amp_mdp.weak_kick_speed_penalty,
+  # Continuous kick intensity command (env.kick_intensity, see
+  # kick_contact_cycle and kick_intensity_obs). Adds a growing penalty once
+  # the ball goes past THIS life's own target speed
+  # (kick_intensity_to_target_speed(env.kick_intensity)) -- inert near
+  # intensity=1 since the target speed there is astronomically high, on top
+  # of the unchanged rewards above -- the robot must still strike the ball
+  # well, but must hold back on power for a low-intensity command.
+  cfg.rewards["kick_speed_cap"] = RewardTermCfg(
+    func=amp_mdp.kick_speed_cap_penalty,
     weight=-50.0,
     params={
       "ball_cfg": SceneEntityCfg(BALL_NAME),
-      "max_speed": WEAK_KICK_MAX_SPEED,
     },
   )
   # Bumped (was -0.2): a proper side-foot kick now pays off twice over --
@@ -576,7 +572,6 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "dist_range": BALL_DIST_RANGE,
       "lateral_range": BALL_LATERAL_RANGE,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
-      "strong_kick_prob": STRONG_KICK_PROB,
     },
   )
   cfg.events["kick_contact_cycle"] = EventTermCfg(
@@ -599,7 +594,6 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
       "right_ball_sensor_name": "r_foot_ball_contact",
       "left_ball_sensor_name": "l_foot_ball_contact",
-      "strong_kick_prob": STRONG_KICK_PROB,
     },
   )
 

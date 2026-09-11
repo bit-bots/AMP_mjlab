@@ -665,31 +665,50 @@ def post_kick_velocity_penalty(
   return torch.where(timer > 0, speed_sq, torch.zeros_like(speed_sq))
 
 
-def weak_kick_speed_penalty(
+def kick_intensity_to_target_speed(intensity: torch.Tensor) -> torch.Tensor:
+  """Continuous, nonlinear map from a per-life commanded kick intensity in
+  [0, 1] (``env.kick_intensity``, see ``kick_contact_cycle``/
+  ``_place_ball_near_robot``, mdp/events.py) to a target ball speed in m/s:
+  intensity=0.0 -> 1 m/s, intensity=0.5 -> 4 m/s, intensity=1.0 -> +inf (an
+  "as hard as possible" kick, no speed cap at all).
+
+  Solved from ``target(x) = a/(1-x) + b`` given ``target(0)=1`` and
+  ``target(0.5)=4``: ``a=3, b=-2``. At ``x=1`` this is a literal division by
+  zero, which torch resolves to ``+inf`` for a float tensor rather than
+  raising -- and every consumer below stays well-defined at ``+inf``
+  (``tanh(inf) == 1``, ``clamp(-inf, min=0) == 0``, no NaNs), so no
+  artificial cap is needed to represent "infinitely strong".
+  """
+  return 3.0 / (1.0 - intensity) - 2.0
+
+
+def kick_speed_cap_penalty(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg,
-  max_speed: float = 1.0,
   timer_attr: str = "kick_timer",
-  strong_attr: str = "kick_strong",
+  intensity_attr: str = "kick_intensity",
 ) -> torch.Tensor:
-  """Penalize the ball going faster than ``max_speed`` during the post-kick
-  window (``env.kick_timer`` > 0), on a WEAK-kick trial only (``env.kick_strong``
-  false -- see ``kick_strong_obs``, mdp/observations.py).
+  """Penalize the ball going faster than the commanded intensity's target
+  speed (``kick_intensity_to_target_speed(env.kick_intensity)``) during the
+  post-kick window (``env.kick_timer`` > 0).
 
-  Grows linearly past ``max_speed`` (like ``foot_base_proximity_penalty``),
+  Grows linearly past the target speed (like ``foot_base_proximity_penalty``),
   0 at or under it, so a full miss is not required to avoid the penalty --
-  only staying under the speed cap is. A strong-kick trial is untouched:
-  ``kick_impact_reward``/``ball_kick_contact_reward``/``kick_direction_reward``
-  keep rewarding a hard, accurate strike exactly as before this term existed.
+  only staying under the speed cap is. At ``env.kick_intensity`` near 1.0 the
+  target speed is astronomically high (see ``kick_intensity_to_target_speed``),
+  so this is effectively inert on a maximum-intensity trial -- replaces the
+  old fixed strong/weak split, where a strong trial was hard-exempted from any
+  penalty; now it's just never close to reachable instead.
   """
   ball: Entity = env.scene[ball_cfg.name]
   ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
-  excess = torch.clamp(ball_speed - max_speed, min=0.0)
   timer = getattr(env, timer_attr, None)
-  strong = getattr(env, strong_attr, None)
-  if timer is None or strong is None:
+  intensity = getattr(env, intensity_attr, None)
+  if timer is None or intensity is None:
     return torch.zeros_like(ball_speed)
-  active = (timer > 0) & ~strong
+  target_speed = kick_intensity_to_target_speed(intensity)
+  excess = torch.clamp(ball_speed - target_speed, min=0.0)
+  active = timer > 0
   return torch.where(active, excess, torch.zeros_like(excess))
 
 
@@ -748,7 +767,6 @@ def kick_impact_reward(
   height_weight: float = 1.0,
   saturation_scale: float = 5.0,
   dir_sigma: float = 0.5,
-  weak_kick_boost: float = 1.0,
 ) -> torch.Tensor:
   """Reward ball speed + height while a post-contact reward window is open,
   scaled by how well the foot was aligned with the ball at the moment of
@@ -785,15 +803,18 @@ def kick_impact_reward(
   ball position/target angle) shouldn't also collect this reward on top of
   ``ball_kick_contact_reward``'s penalty for the same touch.
 
-  ``weak_kick_boost`` multiplies the whole term on a weak-kick life
-  (``env.kick_strong`` false, see ``kick_contact_cycle``): a correctly
-  executed weak kick is deliberately slower than a strong one (capped by
-  ``weak_kick_speed_penalty``), so at ``weak_kick_boost=1.0`` it earns much
-  less here purely from lower speed -- the policy learned to just skip
-  attempting weak kicks rather than take a real ball-approach risk for a
-  small reward. Boosting compensates so a well-placed weak kick is worth
-  roughly as much as a well-placed strong one, without changing the speed
-  cap that makes it "weak". 1.0 on a strong-kick life (no change).
+  A low-intensity life (``env.kick_intensity`` near 0, see
+  ``kick_contact_cycle``) is deliberately capped to a slow ball speed
+  (``kick_speed_cap_penalty``), so at low intensity this term earns much
+  less purely from lower speed -- left alone, the policy learns to skip
+  attempting soft kicks rather than take a real ball-approach risk for a
+  small reward. ``boost = 1 / tanh(target_speed(intensity) * vel_weight /
+  saturation_scale)`` compensates: it's exactly the reciprocal of how much
+  this term's own ``tanh`` saturation discounts a perfectly-hit kick AT the
+  commanded target speed, so a well-placed kick at any intensity scores
+  about the same, without changing the speed cap that makes a low-intensity
+  kick "soft". 1.0 at ``intensity=1`` (target speed +inf, tanh saturates to
+  1, no boost needed -- matches the old strong-kick behavior exactly).
   """
   ball: Entity = env.scene[ball_cfg.name]
   timer = getattr(env, "kick_timer", None)
@@ -817,12 +838,15 @@ def kick_impact_reward(
     if kick_dir is None
     else _kick_dir_factor(ball_vel_xy, kick_dir, dir_sigma)
   )
-  strong = getattr(env, "kick_strong", None)
-  boost = (
-    torch.ones_like(ball_speed)
-    if strong is None
-    else torch.where(strong, torch.ones_like(ball_speed), torch.full_like(ball_speed, weak_kick_boost))
-  )
+  intensity = getattr(env, "kick_intensity", None)
+  if intensity is None:
+    boost = torch.ones_like(ball_speed)
+  else:
+    target_speed = kick_intensity_to_target_speed(intensity)
+    target_saturation = torch.clamp(
+      torch.tanh(target_speed * vel_weight / saturation_scale), min=1e-3
+    )
+    boost = 1.0 / target_saturation
   return torch.where(active, style * bounded * dir_factor * boost, torch.zeros_like(ball_speed))
 
 
