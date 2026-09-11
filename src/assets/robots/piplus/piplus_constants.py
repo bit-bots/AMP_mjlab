@@ -114,43 +114,36 @@ PIPLUS_ACTUATOR_LEG = DelayedActuatorCfg(
 )
 
 ##
-# Keyframe (dataset-mean pose over WalkandRun -- 10 CMU walk clips + their
-# mirrors + the 2 unpaired LAFAN1 run/walk clips, 44503 frames total;
-# per-joint, not L/R symmetric). Regenerated after fixing the GMR retargeting
-# pipeline's left/right arm offset_quat bugs (see general_motion_retargeting
-# git history on piplus-gmr-fixes): the right arm used the same offset_quat
-# as the left (wrong -- arms aren't mirror-symmetric at rest like legs are),
-# and the left arm's own offset had an unfixed ~180 deg axial twist that a
-# T-pose can't observe (so it silently inherited a mismatched convention).
-# Not directly comparable to bitbots_main's static walkready pose -- the two
-# unpaired LAFAN1 clips are long, dynamic running/walking gaits
-# (run1_subject2 alone is 7135 of the 44503 frames), so their swinging-arm
-# mean doesn't sit at a static rest pose the way the paired CMU clips' mean
-# roughly does.
+# Keyframe (dataset-mean pose over WalkandRun -- 10 CMU walk clips + the 2
+# LAFAN1 run/walk clips, plus a mirror of every one of those 12, 69458 frames
+# total). Every clip now has a mirror counterpart (the 2 LAFAN1 clips didn't
+# used to), so the mean is exactly L/R antisymmetric: r_X == -l_X for every
+# joint. Not directly comparable to bitbots_main's static walkready pose --
+# this is the mean of dynamic running/walking gaits, not a rest pose.
 ##
 
 HOME_KEYFRAME = EntityCfg.InitialStateCfg(
-  pos=(0, 0, 0.3559),
+  pos=(0, 0, 0.3532),
   joint_pos={
-    "r_shoulder_pitch_joint": -1.3439,
-    "r_shoulder_roll_joint": -1.0447,
-    "r_upper_arm_joint": -0.4919,
-    "r_elbow_joint": -0.9727,
-    "l_shoulder_pitch_joint": 1.3886,
-    "l_shoulder_roll_joint": 1.1183,
-    "l_upper_arm_joint": 0.4600,
-    "l_elbow_joint": 0.8501,
-    "r_hip_pitch_joint": 0.4942,
-    "r_hip_roll_joint": -0.1108,
-    "r_thigh_joint": 0.1501,
-    "r_calf_joint": 0.6299,
-    "r_ankle_pitch_joint": 0.1735,
+    "r_shoulder_pitch_joint": -1.3329,
+    "r_shoulder_roll_joint": -1.0420,
+    "r_upper_arm_joint": -0.5610,
+    "r_elbow_joint": -1.0056,
+    "l_shoulder_pitch_joint": 1.3329,
+    "l_shoulder_roll_joint": 1.0420,
+    "l_upper_arm_joint": 0.5610,
+    "l_elbow_joint": 1.0055,
+    "r_hip_pitch_joint": 0.5311,
+    "r_hip_roll_joint": -0.0981,
+    "r_thigh_joint": 0.1370,
+    "r_calf_joint": 0.6787,
+    "r_ankle_pitch_joint": 0.1294,
     "r_ankle_roll_joint": 0.0000,
-    "l_hip_pitch_joint": -0.5046,
-    "l_hip_roll_joint": 0.0822,
-    "l_thigh_joint": -0.0952,
-    "l_calf_joint": -0.6319,
-    "l_ankle_pitch_joint": -0.1357,
+    "l_hip_pitch_joint": -0.5311,
+    "l_hip_roll_joint": 0.0981,
+    "l_thigh_joint": -0.1370,
+    "l_calf_joint": -0.6787,
+    "l_ankle_pitch_joint": -0.1294,
     "l_ankle_roll_joint": 0.0000,
   },
   joint_vel={".*": 0.0},
