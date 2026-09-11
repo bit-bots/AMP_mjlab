@@ -665,21 +665,29 @@ def post_kick_velocity_penalty(
   return torch.where(timer > 0, speed_sq, torch.zeros_like(speed_sq))
 
 
+# Reference speed used by kick_impact_reward's extra low-intensity boost
+# below -- the intensity=0.5 point on the target-speed curve.
+KICK_REFERENCE_SPEED = 4.0
+
+
 def kick_intensity_to_target_speed(intensity: torch.Tensor) -> torch.Tensor:
   """Continuous, nonlinear map from a per-life commanded kick intensity in
   [0, 1] (``env.kick_intensity``, see ``kick_contact_cycle``/
   ``_place_ball_near_robot``, mdp/events.py) to a target ball speed in m/s:
-  intensity=0.0 -> 1 m/s, intensity=0.5 -> 4 m/s, intensity=1.0 -> +inf (an
-  "as hard as possible" kick, no speed cap at all).
+  intensity=0.0 -> 2 m/s (the minimum -- a bare touch below this isn't worth
+  distinguishing from noise), intensity=0.5 -> 4 m/s (``KICK_REFERENCE_SPEED``),
+  intensity=1.0 -> +inf (an "as hard as possible" kick, no speed cap at all).
 
-  Solved from ``target(x) = a/(1-x) + b`` given ``target(0)=1`` and
-  ``target(0.5)=4``: ``a=3, b=-2``. At ``x=1`` this is a literal division by
-  zero, which torch resolves to ``+inf`` for a float tensor rather than
-  raising -- and every consumer below stays well-defined at ``+inf``
-  (``tanh(inf) == 1``, ``clamp(-inf, min=0) == 0``, no NaNs), so no
-  artificial cap is needed to represent "infinitely strong".
+  Solved from ``target(x) = a/(1-x)`` given ``target(0)=2`` and
+  ``target(0.5)=4``: ``a=2`` (the ``b`` term used by an earlier version of
+  this curve turned out to be exactly 0 once the floor moved from 1 to 2
+  m/s). At ``x=1`` this is a literal division by zero, which torch resolves
+  to ``+inf`` for a float tensor rather than raising -- and every consumer
+  below stays well-defined at ``+inf`` (``tanh(inf) == 1``, ``clamp(-inf,
+  min=0) == 0``, no NaNs), so no artificial cap is needed to represent
+  "infinitely strong".
   """
-  return 3.0 / (1.0 - intensity) - 2.0
+  return 2.0 / (1.0 - intensity)
 
 
 def kick_speed_cap_penalty(
@@ -808,13 +816,21 @@ def kick_impact_reward(
   (``kick_speed_cap_penalty``), so at low intensity this term earns much
   less purely from lower speed -- left alone, the policy learns to skip
   attempting soft kicks rather than take a real ball-approach risk for a
-  small reward. ``boost = 1 / tanh(target_speed(intensity) * vel_weight /
-  saturation_scale)`` compensates: it's exactly the reciprocal of how much
-  this term's own ``tanh`` saturation discounts a perfectly-hit kick AT the
-  commanded target speed, so a well-placed kick at any intensity scores
-  about the same, without changing the speed cap that makes a low-intensity
-  kick "soft". 1.0 at ``intensity=1`` (target speed +inf, tanh saturates to
-  1, no boost needed -- matches the old strong-kick behavior exactly).
+  small reward. Two multiplicative boosts compensate:
+
+  - ``equalizing_boost = 1 / tanh(target_speed(intensity) * vel_weight /
+    saturation_scale)``: the reciprocal of how much this term's own
+    ``tanh`` saturation discounts a perfectly-hit kick AT the commanded
+    target speed, so a well-placed kick at any intensity would otherwise
+    score about the same. 1.0 at ``intensity=1`` (target speed +inf, tanh
+    saturates to 1 -- matches the old strong-kick behavior exactly).
+  - ``slow_kick_extra_boost = clamp(KICK_REFERENCE_SPEED / target_speed,
+    min=1.0)``: deliberately breaks that equalization in favor of low
+    intensity on top of it -- up to 2x extra at the 2 m/s floor, 1x (no
+    change) at/above ``KICK_REFERENCE_SPEED`` (4 m/s) -- so soft, precise
+    kicks are worth substantially more than just "equal to a hard kick",
+    giving the policy a real incentive to learn power control rather than
+    just always kicking as hard as it can get away with.
   """
   ball: Entity = env.scene[ball_cfg.name]
   timer = getattr(env, "kick_timer", None)
@@ -846,7 +862,16 @@ def kick_impact_reward(
     target_saturation = torch.clamp(
       torch.tanh(target_speed * vel_weight / saturation_scale), min=1e-3
     )
-    boost = 1.0 / target_saturation
+    equalizing_boost = 1.0 / target_saturation
+    # Extra reward for a well-executed SLOW kick, on top of the equalizing
+    # boost above: floored at 1.0 (never reduces a kick at/above
+    # KICK_REFERENCE_SPEED), scaling up to 2x at the minimum target speed
+    # (2 m/s) -- deliberately breaks the "any intensity scores about the
+    # same" equalization above in favor of low intensity, so the policy has
+    # a real incentive to learn precise soft-kick control instead of
+    # defaulting to full power whenever it can get away with it.
+    slow_kick_extra_boost = torch.clamp(KICK_REFERENCE_SPEED / target_speed, min=1.0)
+    boost = equalizing_boost * slow_kick_extra_boost
   return torch.where(active, style * bounded * dir_factor * boost, torch.zeros_like(ball_speed))
 
 
