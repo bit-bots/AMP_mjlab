@@ -15,6 +15,19 @@ from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
+# Reset-frame oversampling weight for clips whose motion_name marks them as a
+# run (currently just "piplus_run1_subject2" in WalkandRun/). Uniform
+# per-frame sampling gives running only its raw frame-count share of the
+# pool (~16%), so the policy barely sees it and ends up walking almost
+# everywhere -- boost it here instead of only reweighting via new data.
+RUN_MOTION_NAME_MARKER = "run"
+RUN_MOTION_SAMPLE_WEIGHT = 2.0
+# At weight=2.0, running goes from its raw ~27% frame share (11890 of 44503
+# frames in WalkandRun/) to ~42% of resets -- a real but not overwhelming
+# boost. Raise this if the policy still favors walking; watch for walking
+# quality degrading if pushed much higher, since it would still be the
+# majority of clips (21 of 22) but a minority of reset frames.
+
 
 class MotionResetManager:
     """Manages motion frame data and delayed-reset logic for AMP environments."""
@@ -113,9 +126,15 @@ class MotionResetManager:
         frames: dict[str, torch.Tensor],
         asset_cfg: SceneEntityCfg,
     ) -> None:
-        total_frames = frames["root_pos"].shape[0]
         num_reset = len(env_ids)
-        idx = torch.randint(0, total_frames, (num_reset,), device=env.device)
+        sample_weight = frames.get("sample_weight")
+        if sample_weight is not None:
+            idx = torch.multinomial(
+                sample_weight.to(env.device), num_reset, replacement=True
+            )
+        else:
+            total_frames = frames["root_pos"].shape[0]
+            idx = torch.randint(0, total_frames, (num_reset,), device=env.device)
 
         asset: Entity = env.scene[asset_cfg.name]
 
@@ -169,13 +188,24 @@ class MotionResetManager:
         root_ang_vel_list = []
         joint_pos_list = []
         joint_vel_list = []
+        sample_weight_list = []
         for motion in motions:
+            num_frames = motion["body_pos_w"].shape[0]
             root_pos_list.append(motion["body_pos_w"][:, 0, :])
             root_quat_list.append(motion["body_quat_w"][:, 0, :])
             root_lin_vel_list.append(motion["body_lin_vel_w"][:, 0, :])
             root_ang_vel_list.append(motion["body_ang_vel_w"][:, 0, :])
             joint_pos_list.append(motion["dof_pos"])
             joint_vel_list.append(motion["dof_vel"])
+            motion_name = motion.get("motion_name", "")
+            weight = (
+                RUN_MOTION_SAMPLE_WEIGHT
+                if RUN_MOTION_NAME_MARKER in motion_name.lower()
+                else 1.0
+            )
+            sample_weight_list.append(
+                torch.full((num_frames,), weight, dtype=torch.float32)
+            )
         return {
             "root_pos": torch.cat(root_pos_list, dim=0),
             "root_quat": torch.cat(root_quat_list, dim=0),
@@ -183,6 +213,7 @@ class MotionResetManager:
             "root_ang_vel": torch.cat(root_ang_vel_list, dim=0),
             "joint_pos": torch.cat(joint_pos_list, dim=0),
             "joint_vel": torch.cat(joint_vel_list, dim=0),
+            "sample_weight": torch.cat(sample_weight_list, dim=0),
         }
 
 
