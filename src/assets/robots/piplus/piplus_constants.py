@@ -114,31 +114,45 @@ PIPLUS_ACTUATOR_LEG = DelayedActuatorCfg(
 )
 
 ##
-# Keyframe (dataset-mean pose from the smp port; per-joint, not L/R symmetric).
+# Keyframe (dataset-mean pose over WalkandRun -- 10 CMU walk clips + the 2
+# LAFAN1 run/walk clips, plus a mirror of every one of those 12, 69458 frames
+# total). Every clip now has a mirror counterpart (the 2 LAFAN1 clips didn't
+# used to), so the mean is exactly L/R antisymmetric: r_X == -l_X for every
+# joint. Not directly comparable to bitbots_main's static walkready pose --
+# this is the mean of dynamic running/walking gaits, not a rest pose.
+#
+# Synced from AMP_mjlab main's piplus_constants.py -- this worktree's own
+# copy had been left on the pre-retargeting-fix values (wrong-signed arm
+# joints) since this file diverged from main on the amp-soccer-kick branch,
+# same class of miss as the run-motion reset-sampling weight (see
+# mdp/events.py git history): a fix landed on main and never got ported over
+# here. Confirmed by diff against main: this keyframe block was the only
+# unintended difference (the actuator-delay range above is a real,
+# intentional kick-specific divergence and was left untouched).
 ##
 
 HOME_KEYFRAME = EntityCfg.InitialStateCfg(
-  pos=(0, 0, 0.3413),
+  pos=(0, 0, 0.3532),
   joint_pos={
-    "r_shoulder_pitch_joint": 1.2902,
-    "r_shoulder_roll_joint": 1.1479,
-    "r_upper_arm_joint": -0.1694,
-    "r_elbow_joint": 1.8082,
-    "l_shoulder_pitch_joint": -1.3218,
-    "l_shoulder_roll_joint": -1.0850,
-    "l_upper_arm_joint": 0.1584,
-    "l_elbow_joint": -1.9507,
-    "r_hip_pitch_joint": 0.6691,
-    "r_hip_roll_joint": -0.1417,
-    "r_thigh_joint": 0.1645,
-    "r_calf_joint": 1.0644,
-    "r_ankle_pitch_joint": 0.1619,
+    "r_shoulder_pitch_joint": -1.3329,
+    "r_shoulder_roll_joint": -1.0420,
+    "r_upper_arm_joint": -0.5610,
+    "r_elbow_joint": -1.0056,
+    "l_shoulder_pitch_joint": 1.3329,
+    "l_shoulder_roll_joint": 1.0420,
+    "l_upper_arm_joint": 0.5610,
+    "l_elbow_joint": 1.0055,
+    "r_hip_pitch_joint": 0.5311,
+    "r_hip_roll_joint": -0.0981,
+    "r_thigh_joint": 0.1370,
+    "r_calf_joint": 0.6787,
+    "r_ankle_pitch_joint": 0.1294,
     "r_ankle_roll_joint": 0.0000,
-    "l_hip_pitch_joint": -0.6540,
-    "l_hip_roll_joint": 0.1116,
-    "l_thigh_joint": -0.1363,
-    "l_calf_joint": -1.0866,
-    "l_ankle_pitch_joint": -0.1045,
+    "l_hip_pitch_joint": -0.5311,
+    "l_hip_roll_joint": 0.0981,
+    "l_thigh_joint": -0.1370,
+    "l_calf_joint": -0.6787,
+    "l_ankle_pitch_joint": -0.1294,
     "l_ankle_roll_joint": 0.0000,
   },
   joint_vel={".*": 0.0},
