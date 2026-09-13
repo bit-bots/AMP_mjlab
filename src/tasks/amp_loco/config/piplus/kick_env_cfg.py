@@ -417,10 +417,10 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # short-air-time-only penalty): +1 per foot whose current swing (air time)
   # falls in a MEDIUM range (0.05s-0.5s, mjlab's own defaults), no
   # command_name (the kick task has none, matching foot_slip above). Bumped
-  # from 1.0.
+  # from 1.0, then again from 2.5.
   cfg.rewards["foot_air_time"] = RewardTermCfg(
     func=feet_air_time,
-    weight=2.5,
+    weight=3.5,
     params={"sensor_name": "feet_ground_contact"},
   )
   # Tiny torque penalty (not present anywhere in the kick task's reward set
