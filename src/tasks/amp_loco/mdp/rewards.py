@@ -671,7 +671,7 @@ KICK_REFERENCE_SPEED = 4.0
 # How much slow_kick_extra_boost amplifies the "reward for a slow, precise
 # kick" signal, applied to the excess above 1.0 so it stays exactly 1.0
 # (unchanged) at/above KICK_REFERENCE_SPEED -- see kick_impact_reward.
-SLOW_KICK_BOOST_MULTIPLIER = 20.0
+SLOW_KICK_BOOST_MULTIPLIER = 10.0
 
 
 def kick_intensity_to_target_speed(intensity: torch.Tensor) -> torch.Tensor:
