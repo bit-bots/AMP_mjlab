@@ -324,6 +324,11 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       "std": 0.07,
       "std_post_kick": 1.0,
+      # Range/bearing noise stacked on top of the isotropic std above (see
+      # object_pos_b_noisy docstring) -- NOT env.kick_dir_world, just the
+      # ball's own local-frame position treated as polar coordinates.
+      "range_noise_std": 0.2,
+      "bearing_noise_std_deg": 5.0,
     },
     # Actor-only random observation delay, up to 0.2s (step_dt=0.02s -> 10
     # steps), re-sampled per env every step (mjlab's built-in delay pipeline,

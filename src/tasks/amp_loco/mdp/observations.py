@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -137,6 +138,8 @@ def object_pos_b_noisy(
     std: float = 0.07,
     std_post_kick: float = 1.0,
     timer_attr: str = "kick_timer",
+    range_noise_std: float = 0.2,
+    bearing_noise_std_deg: float = 5.0,
 ) -> torch.Tensor:
     """Actor-only noisy variant of ``object_pos_b``: much noisier during the
     post-kick phase (``timer_attr`` on ``env`` > 0, see ``kick_state_obs``)
@@ -144,12 +147,36 @@ def object_pos_b_noisy(
     good track of the ball right after a fast kick (motion blur / high ball
     speed), not just a flat perception-noise floor throughout.
 
+    On top of that isotropic Cartesian noise, also applies range/bearing
+    noise in the anchor's local xy-plane: the ball's true (x, y) there is
+    treated as polar coordinates (range ``r = norm(x, y)``, bearing
+    ``theta = atan2(y, x)`` -- the direction FROM the robot TO the ball, not
+    ``env.kick_dir_world``, which is the commanded direction to kick it in
+    and is unrelated to this noise). ``range_noise_std`` is relative (e.g.
+    0.2 = 20% of the current range, so error grows with distance, like a real
+    range sensor); ``bearing_noise_std_deg`` is an absolute angular error in
+    degrees (like a real bearing/angle-of-view estimate, roughly
+    distance-independent). This model is applied to the true position BEFORE
+    the isotropic noise below, so the two stack as independent error sources
+    rather than one replacing the other.
+
     Noise is applied here (per-env-conditional std), not via the generic
     ``ObservationTermCfg.noise`` pipeline (a single fixed ``GaussianNoiseCfg``
     can't vary by state); ``ObservationTermCfg.delay_max_lag`` still applies
     downstream as normal.
     """
     pos_b = object_pos_b(env, object_cfg, anchor_cfg)
+
+    xy = pos_b[:, :2]
+    r = torch.norm(xy, dim=-1)
+    theta = torch.atan2(xy[:, 1], xy[:, 0])
+    r_noisy = r * (1.0 + torch.randn_like(r) * range_noise_std)
+    theta_noisy = theta + torch.randn_like(theta) * math.radians(bearing_noise_std_deg)
+    xy_noisy = torch.stack(
+        [r_noisy * torch.cos(theta_noisy), r_noisy * torch.sin(theta_noisy)], dim=-1
+    )
+    pos_b = torch.cat([xy_noisy, pos_b[:, 2:]], dim=-1)
+
     timer = getattr(env, timer_attr, None)
     if timer is None:
         post_kick = torch.zeros(pos_b.shape[0], dtype=torch.bool, device=pos_b.device)
