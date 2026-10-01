@@ -97,7 +97,19 @@ BALL_SIZE_MASS_SCALE_RANGE = (1.0, 0.2)  # (mean, std) scale factor.
 # multiplicatively around the nominal 0.6 rather than linearly. Rolling
 # (axis 2) already looks right and torsional (axis 1) wasn't flagged, so
 # both are left at their fixed nominal values (see BALL_FRICTION, ball.py).
+# UPDATE: both are now randomized too, see the ranges below.
 BALL_SLIDING_FRICTION_RANGE = (0.1, 1.6)
+# Torsional (spin about the contact normal, axis 1) and rolling (axis 2)
+# friction, both log_uniform. The units are LENGTHS: the friction torque limit
+# is mu * normal force. Measured in MuJoCo for this ball (r=0.07 m, 0.205 kg,
+# priority above ground):
+#   rolling mu  0.004 / 0.016 / 0.1  -> from 2 m/s rolls 5.5 / 1.7 / 0.6 m
+#                                       (mean decel 0.35 / 1.3 / 3.7 m/s^2)
+#   torsional mu 0.001 / 0.005 / 0.1 -> spin of 15 rad/s stops in 6 / 0.7 / 0 s
+# Upper ends are the old fixed nominal (0.1, a dead-stop ball that was judged
+# to look right); lower ends are a real ball on a hard floor or short turf.
+BALL_ROLLING_FRICTION_RANGE = (0.004, 0.1)
+BALL_TORSIONAL_FRICTION_RANGE = (0.001, 0.1)
 
 # Ball spawn/respawn geometry: forward distance from the robot + a
 # distance-scaled lateral offset (see _place_ball_near_robot, mdp/events.py)
@@ -221,6 +233,28 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "distribution": "log_uniform",
       "ranges": BALL_SLIDING_FRICTION_RANGE,
       "axes": [0],
+    },
+  )
+  cfg.events["ball_rolling_friction"] = EventTermCfg(
+    mode="startup",
+    func=dr.geom_friction,
+    params={
+      "asset_cfg": SceneEntityCfg(BALL_NAME, geom_names=(BALL_GEOM_NAME,)),
+      "operation": "abs",
+      "distribution": "log_uniform",
+      "ranges": BALL_ROLLING_FRICTION_RANGE,
+      "axes": [2],
+    },
+  )
+  cfg.events["ball_torsional_friction"] = EventTermCfg(
+    mode="startup",
+    func=dr.geom_friction,
+    params={
+      "asset_cfg": SceneEntityCfg(BALL_NAME, geom_names=(BALL_GEOM_NAME,)),
+      "operation": "abs",
+      "distribution": "log_uniform",
+      "ranges": BALL_TORSIONAL_FRICTION_RANGE,
+      "axes": [1],
     },
   )
 
@@ -699,5 +733,14 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "end_step": 12000 * 24,
     },
   )
+
+  # Viewer only: domain randomization (friction, COM, ball size/mass, ...) is
+  # sampled once per env at startup in training (4096 envs = 4096 draws), but
+  # a play session has 1-few envs, so one fixed draw would last the whole
+  # session. Resample every startup DR event on each reset instead.
+  if play:
+    for _ev in cfg.events.values():
+      if _ev.mode == "startup" and "mdp.dr" in getattr(_ev.func, "__module__", ""):
+        _ev.mode = "reset"
 
   return cfg
