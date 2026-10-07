@@ -112,13 +112,23 @@ def robot_body_lin_vel_b(
 
     return body_lin_vel_b.reshape(env.num_envs, -1)
 
+# Ball observation limits. A kicked ball with low rolling friction can roll tens
+# of meters (and fast) within one episode; the unbounded values then reach the
+# actor/critic and their observation normalization as huge inputs, which
+# produced giant actions (action_rate_l2 spikes) and a policy collapse. Real
+# ball positions in this task stay within a few meters.
+OBJECT_POS_CLIP_M = 10.0
+OBJECT_VEL_CLIP_MS = 15.0
+
+
 def object_pos_b(
     env: ManagerBasedRlEnv,
     object_cfg: SceneEntityCfg,
     anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
 ) -> torch.Tensor:
     """Free-body object's root position relative to the anchor body (e.g. ball in
-    torso frame), used in place of a velocity command for goal-directed tasks."""
+    torso frame), used in place of a velocity command for goal-directed tasks.
+    Clipped to +-OBJECT_POS_CLIP_M per axis."""
     anchor: Entity = env.scene[anchor_cfg.name]
     obj: Entity = env.scene[object_cfg.name]
 
@@ -128,7 +138,7 @@ def object_pos_b(
     pos_b, _ = subtract_frame_transforms(
         anchor_pos_w, anchor_quat_w, obj.data.root_link_pos_w, obj.data.root_link_quat_w,
     )
-    return pos_b
+    return pos_b.clamp(-OBJECT_POS_CLIP_M, OBJECT_POS_CLIP_M)
 
 
 def object_pos_b_noisy(
@@ -195,12 +205,14 @@ def object_lin_vel_b(
     object_cfg: SceneEntityCfg,
     anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
 ) -> torch.Tensor:
-    """Free-body object's linear velocity expressed in the anchor body's frame."""
+    """Free-body object's linear velocity expressed in the anchor body's frame.
+    Clipped to +-OBJECT_VEL_CLIP_MS per axis."""
     anchor: Entity = env.scene[anchor_cfg.name]
     obj: Entity = env.scene[object_cfg.name]
 
     anchor_quat_w = anchor.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
-    return quat_apply_inverse(anchor_quat_w, obj.data.root_link_lin_vel_w)
+    vel_b = quat_apply_inverse(anchor_quat_w, obj.data.root_link_lin_vel_w)
+    return vel_b.clamp(-OBJECT_VEL_CLIP_MS, OBJECT_VEL_CLIP_MS)
 
 
 def kick_dir_heading_b(

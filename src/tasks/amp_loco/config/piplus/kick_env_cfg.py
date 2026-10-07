@@ -106,9 +106,13 @@ BALL_SLIDING_FRICTION_RANGE = (0.1, 1.6)
 #   rolling mu  0.004 / 0.016 / 0.1  -> from 2 m/s rolls 5.5 / 1.7 / 0.6 m
 #                                       (mean decel 0.35 / 1.3 / 3.7 m/s^2)
 #   torsional mu 0.001 / 0.005 / 0.1 -> spin of 15 rad/s stops in 6 / 0.7 / 0 s
+# Rolling lower end raised from 0.004 to 0.01 (6 m -> 2.9 m roll-out from 2 m/s,
+# 0.7 m/s^2): at 0.004 a hard kick sent the ball tens of meters away, and the
+# huge ball-position observation collapsed training (see OBJECT_POS_CLIP_M in
+# observations.py).
 # Upper ends are the old fixed nominal (0.1, a dead-stop ball that was judged
 # to look right); lower ends are a real ball on a hard floor or short turf.
-BALL_ROLLING_FRICTION_RANGE = (0.004, 0.1)
+BALL_ROLLING_FRICTION_RANGE = (0.01, 0.1)
 BALL_TORSIONAL_FRICTION_RANGE = (0.001, 0.1)
 
 # Ball spawn/respawn geometry: forward distance from the robot + a
@@ -179,6 +183,17 @@ KICK_DIR_SIGMA_END = math.radians(15.0)
 
 def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = piplus_amp_flat_env_cfg(play=play)
+
+  # Clip the policy action to the joint limits (see LimitedJointPositionAction).
+  # The unclipped actions diverged to 1e3-1e26 through the "last action"
+  # observation feedback and collapsed training.
+  _a = cfg.actions["joint_pos"]
+  cfg.actions["joint_pos"] = amp_mdp.LimitedJointPositionActionCfg(
+    entity_name=_a.entity_name,
+    actuator_names=_a.actuator_names,
+    scale=_a.scale,
+    use_default_offset=_a.use_default_offset,
+  )
 
   # --- Terrain: mostly flat, ramping toward mostly non-flat over training --
   # piplus_amp_flat_env_cfg leaves a plain flat plane (no columns to choose
