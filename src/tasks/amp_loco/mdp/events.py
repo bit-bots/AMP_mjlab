@@ -435,6 +435,68 @@ def reset_ball_near_robot(
         env.kick_style[env_ids] = 0.0
 
 
+# Measured in the training sim (mujoco_warp, ball radius, mass, friction and
+# torsional friction randomization on): the ball rolls this many times farther
+# than the energy model in ``random_ball_push`` says, per rolling friction
+# value. The launch speed is scaled down by the square root of the ratio.
+_ROLL_FRICTION_POINTS = (0.01, 0.03, 0.1)
+_ROLL_DISTANCE_RATIO = (1.7, 3.0, 3.2)
+
+
+def random_ball_push(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    ball_cfg: SceneEntityCfg,
+    distance_range: tuple[float, float] = (0.05, 2.0),
+) -> None:
+    """Interval event: give the ball a random horizontal velocity so that it
+    rolls about ``distance`` meters, with ``distance`` log-uniform in
+    ``distance_range`` and a uniform random heading.
+
+    The launch speed comes from the energy of a ball that rolls without slip
+    (kinetic energy 0.7 m v^2) and loses it to the rolling friction torque
+    (mu_r m g per radian), with the env's own ball radius and rolling friction
+    draw. The ball also gets the spin of rolling without slip, so sliding
+    friction does not eat part of the energy. The distance is approximate.
+
+    Skipped while the post-kick window runs (``env.kick_timer`` > 0), so a push
+    never disturbs the reward window of a kick.
+    """
+    if hasattr(env, "kick_timer"):
+        env_ids = env_ids[env.kick_timer[env_ids] == 0]
+    n = env_ids.shape[0]
+    if n == 0:
+        return
+    ball: Entity = env.scene[ball_cfg.name]
+    geom_id = ball.indexing.geom_ids[0]
+    model = env.sim.model
+    world = env_ids % model.geom_friction.shape[0]
+    mu_r = model.geom_friction[world, geom_id, 2].clamp(min=1e-3)
+    radius = model.geom_size[env_ids % model.geom_size.shape[0], geom_id, 0]
+
+    lo, hi = distance_range
+    u = torch.rand(n, device=env.device)
+    distance = lo * (hi / lo) ** u
+    points = torch.tensor(_ROLL_FRICTION_POINTS, device=env.device)
+    ratios = torch.tensor(_ROLL_DISTANCE_RATIO, device=env.device)
+    # Piecewise-linear interpolation of the measured ratio (clamped at the ends).
+    mu_c = mu_r.clamp(points[0], points[-1])
+    idx = torch.clamp(torch.searchsorted(points, mu_c) - 1, 0, len(points) - 2)
+    frac = (mu_c - points[idx]) / (points[idx + 1] - points[idx])
+    ratio = ratios[idx] + frac * (ratios[idx + 1] - ratios[idx])
+    g = 9.81
+    speed = torch.sqrt(distance * mu_r * g / (0.7 * radius * ratio))
+
+    heading = torch.rand(n, device=env.device) * (2.0 * math.pi)
+    direction = torch.stack([torch.cos(heading), torch.sin(heading)], dim=-1)
+    vel = torch.zeros((n, 6), device=env.device)
+    vel[:, 0:2] = direction * speed.unsqueeze(-1)
+    # Rolling without slip on flat ground: omega = (z_hat x v) / r.
+    vel[:, 3] = -direction[:, 1] * speed / radius
+    vel[:, 4] = direction[:, 0] * speed / radius
+    ball.write_root_link_velocity_to_sim(vel, env_ids=env_ids)
+
+
 @requires_model_fields("geom_rgba")
 class kick_contact_cycle:
     """Contact-driven ball cycle: kicking -> post-kick -> kicking.

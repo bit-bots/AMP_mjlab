@@ -56,6 +56,13 @@ from src.tasks.amp_loco.mdp.terrain import (
 )
 
 BALL_NAME = "ball"
+
+# Random ball nudges: interval per env (s) and how far the ball rolls (m).
+BALL_PUSH_INTERVAL_S = (10.0, 30.0)
+BALL_PUSH_DISTANCE_RANGE = (0.05, 2.0)
+# Horizontal distance (m) from base_link under which the ball counts as under
+# the robot.
+BALL_UNDER_BASE_RADIUS = 0.05
 BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball.py)
 RIGHT_FOOT_SUBTREE = "r_ankle_roll_link"
 LEFT_FOOT_SUBTREE = "l_ankle_roll_link"
@@ -627,6 +634,17 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "min_dist": FOOT_BASE_MIN_DIST,
     },
   )
+  # Hefty penalty for the ball ending up under the robot (within 5 cm of the
+  # base_link projected onto the ground): a kick is impossible from there.
+  cfg.rewards["ball_under_base"] = RewardTermCfg(
+    func=amp_mdp.ball_under_base_penalty,
+    weight=-20.0,
+    params={
+      "ball_cfg": SceneEntityCfg(BALL_NAME),
+      "base_cfg": SceneEntityCfg("robot", body_names=(ROOT_NAME,)),
+      "radius": BALL_UNDER_BASE_RADIUS,
+    },
+  )
   # Discourage double-touching the ball with both feet: once one foot has
   # touched it first (this ball "life"), the other foot subsequently also
   # touching is penalized -- kicking should be a single clean strike with
@@ -650,6 +668,18 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "dist_range": BALL_DIST_RANGE,
       "lateral_range": BALL_LATERAL_RANGE,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
+    },
+  )
+  # Random ball nudge every 10 to 30 s per env (not during the post-kick
+  # window): rolls the ball from a few cm up to about 2 m, so the robot must
+  # keep re-approaching a moving ball instead of waiting for the next reset.
+  cfg.events["random_ball_push"] = EventTermCfg(
+    func=amp_mdp.random_ball_push,
+    mode="interval",
+    interval_range_s=BALL_PUSH_INTERVAL_S,
+    params={
+      "ball_cfg": SceneEntityCfg(BALL_NAME),
+      "distance_range": BALL_PUSH_DISTANCE_RANGE,
     },
   )
   cfg.events["kick_contact_cycle"] = EventTermCfg(

@@ -465,6 +465,22 @@ def foot_base_proximity_penalty(
   return torch.clamp(min_dist - dist, min=0.0)
 
 
+def ball_under_base_penalty(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  base_cfg: SceneEntityCfg,
+  radius: float = 0.05,
+) -> torch.Tensor:
+  """1 while the ball center is within ``radius`` (horizontal distance) of the
+  base_link projected onto the ground, else 0 -- the ball is then under the
+  robot, between the legs, where a kick is not possible."""
+  ball: Entity = env.scene[ball_cfg.name]
+  robot: Entity = env.scene[base_cfg.name]
+  ball_xy = ball.data.root_link_pos_w[:, :2]
+  base_xy = robot.data.body_link_pos_w[:, base_cfg.body_ids[0], :2]
+  return (torch.norm(ball_xy - base_xy, dim=-1) < radius).float()
+
+
 def object_contact_reward(
   env: ManagerBasedRlEnv,
   sensor_name: str,
