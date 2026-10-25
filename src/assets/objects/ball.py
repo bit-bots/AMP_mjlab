@@ -38,7 +38,7 @@ def _get_ball_spec() -> mujoco.MjSpec:
   )
   geom.friction = list(BALL_FRICTION)
   geom.condim = 6
-  # Priority 2 > the robot's collision geoms (1) and the terrain (0): MuJoCo
+  # Priority 2 > the terrain (1) and the robot's collision geoms (0): MuJoCo
   # then uses ONLY the ball's friction/condim in every ball contact. With
   # equal or lower priority, the foot (condim 3) would override the ball in
   # foot-ball contact, so the ball's torsional/rolling friction (and its

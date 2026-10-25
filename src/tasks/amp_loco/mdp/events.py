@@ -26,10 +26,8 @@ from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 # Extra height above the estimated local ground level to spawn the ball at
 # -- see _place_ball_near_robot -- so small terrain-height estimation error
-# never buries it. Sized to clear KICK_TERRAIN_CFG's tilted_grid worst case:
-# a tile corner can sit up to ~(height_range/2 + tilt-induced rise) above
-# the patch's flat env_origins baseline (~0.026m at its current settings);
-# 0.08 leaves comfortable headroom above that.
+# never buries it. Sized to clear a bump of a few centimeters on non-flat terrain;
+# the kick task trains on a flat plane, where it only adds a short drop.
 _BALL_SPAWN_HEIGHT_MARGIN = 0.08
 
 
@@ -351,7 +349,7 @@ def _place_ball_near_robot(
 
     # Ground level is BALL_RADIUS above the robot's own terrain patch
     # baseline (env_origins' z), not a fixed world z=0 -- a non-flat terrain
-    # patch (e.g. KICK_TERRAIN_CFG's tilted-grid platform) can sit well
+    # patch (e.g. a tilted-grid platform) can sit well
     # above/below world z=0, and spawning at a fixed world height would
     # bury or float the ball. env_origins reflects the patch the robot was
     # last placed on, which is a good local approximation (not exact -- the
@@ -457,7 +455,7 @@ class kick_contact_cycle:
     WITHOUT ending the episode, and the cycle returns to kicking.
 
     Speed alone isn't enough to detect a kick: on non-flat terrain
-    (KICK_TERRAIN_CFG) a resting ball can pick up real velocity from
+    a resting ball can pick up real velocity from
     gravity alone (rolling down a tilted tile, settling off a bump) with no
     foot anywhere near it. Contact alone isn't enough either: the
     continuous per-step version paid out for every step of contact,
@@ -594,7 +592,7 @@ class kick_contact_cycle:
         # All params unused here; resolved once in __init__.
 
         # Ball speed exceeding the threshold alone isn't enough: on
-        # non-flat terrain (KICK_TERRAIN_CFG) a resting ball can pick up
+        # non-flat terrain a resting ball can pick up
         # real velocity from gravity alone (rolling down a tilted tile,
         # settling off a bump) with no foot anywhere near it. Require an
         # ACTUAL foot/ball contact too -- contact_sensor_touched

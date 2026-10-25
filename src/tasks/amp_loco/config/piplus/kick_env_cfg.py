@@ -27,6 +27,7 @@ and WHEN that motion fires:
 
 import copy
 import math
+import dataclasses
 import os
 
 import torch
@@ -50,9 +51,8 @@ from src.tasks.amp_loco.config.piplus.env_cfgs import (
   piplus_amp_flat_env_cfg,
 )
 from src.tasks.amp_loco.mdp.terrain import (
-  KICK_TERRAIN_CFG,
-  KICK_TERRAIN_FLAT_COLS,
-  KICK_TERRAIN_NONFLAT_COLS,
+  randomize_terrain_contact,
+  terrain_collisions,
 )
 
 BALL_NAME = "ball"
@@ -195,22 +195,45 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     use_default_offset=_a.use_default_offset,
   )
 
-  # --- Terrain: mostly flat, ramping toward mostly non-flat over training --
-  # piplus_amp_flat_env_cfg leaves a plain flat plane (no columns to choose
-  # between); swap in the generator grid (KICK_TERRAIN_CFG, mdp/terrain.py)
-  # so terrain_flat_fraction_curriculum (below) has flat/tilted/perlin
-  # columns to reassign resetting envs between. Contact budgets bumped back
-  # up from the flat cfg's reduced values (a plain plane needs far fewer
-  # contacts than heightfield/mesh terrain) -- not as high as the rough
-  # cfg's, since only a fraction of envs are ever on non-flat ground and the
-  # features are deliberately mild.
-  cfg.scene.terrain.terrain_type = "generator"
-  cfg.scene.terrain.terrain_generator = KICK_TERRAIN_CFG
-  cfg.scene.terrain.max_init_terrain_level = None
-  cfg.sim.njmax = 1200
-  cfg.sim.mujoco.ccd_iterations = 150
-  cfg.sim.contact_sensor_maxmatch = 400
-  cfg.sim.nconmax = 128
+  # --- Terrain: flat plane with the booster_mjlab contact model -----------
+  # Like the booster_mjlab Flat-Amp task: a plane (piplus_amp_flat_env_cfg)
+  # with a randomized short-turf contact compliance and friction range. The
+  # contact budgets stay at the flat cfg's values.
+  cfg.scene.terrain.collisions = terrain_collisions()
+  # MuJoCo uses the contact parameters of the geom with the higher priority
+  # alone. The floor (priority 1) outranks the robot (priority 0), so the
+  # randomized floor friction and turf compliance apply in every robot-floor
+  # contact without blending. The ball (priority 2) outranks the floor, so its
+  # own friction and compliance apply in every ball contact.
+  _robot = cfg.scene.entities["robot"]
+  _robot.collisions = tuple(
+    dataclasses.replace(_c, priority=0) for _c in _robot.collisions
+  )
+  # Short-turf contact compliance, one draw per env at startup.
+  cfg.events["terrain_contact"] = EventTermCfg(
+    func=randomize_terrain_contact,
+    mode="startup",
+    params={
+      "asset_cfg": SceneEntityCfg("terrain"),
+      "solref_ranges": {0: (0.006, 0.03), 1: (0.95, 1.05)},
+      "solimp_ranges": {0: (0.88, 0.92), 1: (0.94, 0.99), 2: (0.003, 0.01)},
+      "shared_random": True,
+    },
+  )
+  # Booster foot friction range (the AMP base cfg uses 0.3 to 1.2), drawn on
+  # the floor geom because the floor decides the robot-floor friction. One
+  # draw per env, as for the shared foot friction before.
+  del cfg.events["foot_friction"]
+  cfg.events["floor_friction"] = EventTermCfg(
+    mode="startup",
+    func=dr.geom_friction,
+    params={
+      "asset_cfg": SceneEntityCfg("terrain", geom_names=("terrain",)),
+      "operation": "abs",
+      "ranges": (0.75, 1.25),
+      "shared_random": True,
+    },
+  )
 
   # --- Ball entity --------------------------------------------------------
   cfg.scene.entities[BALL_NAME] = get_ball_cfg()
@@ -735,28 +758,16 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "end_value": KICK_DIR_SIGMA_END,
     },
   )
-  # Ramp the fraction of envs on non-flat terrain (KICK_TERRAIN_CFG above)
-  # from 1/10 at the start of training to 2/3 by iteration 12000, so the
-  # policy first learns to approach/kick on flat ground before having to
-  # cope with uneven footing too.
-  cfg.curriculum["terrain_nonflat_fraction"] = CurriculumTermCfg(
-    func=amp_mdp.terrain_flat_fraction_curriculum,
-    params={
-      "flat_cols": KICK_TERRAIN_FLAT_COLS,
-      "nonflat_cols": KICK_TERRAIN_NONFLAT_COLS,
-      "start_nonflat_frac": 0.1,
-      "end_nonflat_frac": 2.0 / 3.0,
-      "end_step": 12000 * 24,
-    },
-  )
-
   # Viewer only: domain randomization (friction, COM, ball size/mass, ...) is
   # sampled once per env at startup in training (4096 envs = 4096 draws), but
   # a play session has 1-few envs, so one fixed draw would last the whole
   # session. Resample every startup DR event on each reset instead.
   if play:
     for _ev in cfg.events.values():
-      if _ev.mode == "startup" and "mdp.dr" in getattr(_ev.func, "__module__", ""):
+      if _ev.mode == "startup" and (
+        "mdp.dr" in getattr(_ev.func, "__module__", "")
+        or _ev.func is randomize_terrain_contact
+      ):
         _ev.mode = "reset"
 
   return cfg
