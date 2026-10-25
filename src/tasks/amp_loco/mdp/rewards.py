@@ -646,6 +646,29 @@ def standing_still_penalty(
   return (standing_still & not_touched_yet & not_post_kick).float()
 
 
+def feet_air_time_pre_kick(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  threshold_min: float = 0.05,
+  threshold_max: float = 0.5,
+  timer_attr: str = "kick_timer",
+) -> torch.Tensor:
+  """mjlab's ``feet_air_time`` (+1 per foot whose current swing lasts
+  threshold_min..threshold_max s), but zero during the post-kick window
+  (``env.kick_timer`` > 0): the robot should settle after the strike, not keep
+  stepping for air-time reward.
+  """
+  from mjlab.tasks.velocity.mdp.rewards import feet_air_time
+
+  reward = feet_air_time(
+    env, sensor_name=sensor_name, threshold_min=threshold_min, threshold_max=threshold_max
+  )
+  timer = getattr(env, timer_attr, None)
+  if timer is None:
+    return reward
+  return reward * (timer == 0).float()
+
+
 def post_kick_velocity_penalty(
   env: ManagerBasedRlEnv,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),

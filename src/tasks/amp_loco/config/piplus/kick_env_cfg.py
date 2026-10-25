@@ -438,7 +438,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # past it while the ball is still being "farmed" for kick_impact reward.
   cfg.rewards["post_kick_stop"] = RewardTermCfg(
     func=amp_mdp.post_kick_velocity_penalty,
-    weight=-0.3,
+    weight=-3.0,  # was -0.3: the robot kept walking after the strike
     params={"anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,))},
   )
   # Small dense reward for facing the ball (mirrors mjxperiment's
@@ -472,8 +472,9 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # falls in a MEDIUM range (0.05s-0.5s, mjlab's own defaults), no
   # command_name (the kick task has none, matching foot_slip above). Bumped
   # from 1.0, then again from 2.5.
+  # Air-time reward is switched off in the post-kick window (kick_timer > 0).
   cfg.rewards["foot_air_time"] = RewardTermCfg(
-    func=feet_air_time,
+    func=amp_mdp.feet_air_time_pre_kick,
     weight=3.5,
     params={"sensor_name": "feet_ground_contact"},
   )

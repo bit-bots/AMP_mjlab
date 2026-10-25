@@ -12,6 +12,7 @@ mjlab_piplus's 1.3.0 ``XmlActuatorCfg`` combines.)
 from pathlib import Path
 
 import mujoco
+import numpy as np
 
 from mjlab.actuator import BuiltinPositionActuatorCfg, DelayedActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
@@ -33,6 +34,12 @@ PIPLUS_XML: Path = SRC_PATH / "assets" / "robots" / "piplus" / "xmls" / "piplus.
 assert PIPLUS_XML.exists()
 
 
+# Diagnostic: zero the MJCF's passive joint damping (0.25 arms / 0.75 legs Nm*s/rad, on
+# top of the actuator kd), as in the booster_mjlab walk run. Friction loss and armature
+# are unchanged. Set False for the real robot's model.
+REMOVE_PASSIVE_DAMPING = True
+
+
 def get_assets(meshdir: str) -> dict[str, bytes]:
   assets: dict[str, bytes] = {}
   update_assets(assets, PIPLUS_XML.parent / "meshes", meshdir)
@@ -49,6 +56,10 @@ def get_spec() -> mujoco.MjSpec:
   # double actuation (nu=40) with the XML set idle at ctrl=0 fighting the policy.
   for act in list(spec.actuators):
     spec.delete(act)
+  if REMOVE_PASSIVE_DAMPING:
+    for joint in spec.joints:
+      if joint.type != mujoco.mjtJoint.mjJNT_FREE:
+        joint.damping = np.zeros(3)
   return spec
 
 

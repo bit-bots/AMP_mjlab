@@ -54,7 +54,7 @@ def piplus_amp_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
     wandb_project="piplus_amp",
     save_interval=100,
     num_steps_per_env=24,
-    max_iterations=100001,
+    max_iterations=30_000,
     amp_reward_coef=0.1,
     amp_motion_files=os.path.normpath(_MOTION_DATA_DIR),
     amp_num_preload_transitions=200000,
@@ -98,7 +98,9 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
   (~15% style), 0.2/0.9 (~8% style), 0.2/0.85 (~12% style), 0.2/0.8
   (~16% style), 0.2/0.7 (~24% style), 0.2/0.6 (~32% style), amp_reward_coef
   lowered to 0.13/0.6 (~22% style), lerp lowered to 0.13/0.45 (~40% style),
-  now lerp lowered further to 0.13/0.35 (~48% style) -- applied from the
+  lerp lowered further to 0.13/0.35 (~48% style). 0.2/0.25 (stricter, ~2.5x the
+  style-to-task ratio) learned the style but NOT the kick (kick_impact 0.12 vs 4.8
+  at iteration 4000), so the middle ground 0.16/0.30 (~1.5x) is used now -- applied from the
   start of training (not a curriculum), unlike the torque/action-rate
   penalty bump below.
   """
@@ -115,7 +117,8 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
     experiment_name="piplus_amp_kick",
     wandb_project="piplus_amp_kick",
     amp_motion_files=os.path.normpath(os.path.join(_MOTION_DATA_DIR, "KickAndRun")),
-    amp_reward_coef=0.13,
-    amp_task_reward_lerp=0.35,
+    amp_reward_coef=0.16,
+    amp_task_reward_lerp=0.30,
     save_interval=500,
+    max_iterations=30_000,  # was 100001; the kick policy converges (or breaks) well before
   )
