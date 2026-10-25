@@ -57,6 +57,9 @@ from src.tasks.amp_loco.mdp.terrain import (
 
 BALL_NAME = "ball"
 
+# The ball respawns after a kick only if it moved at least this far (m).
+KICK_MIN_BALL_TRAVEL = 0.3
+
 # Random ball nudges: interval per env (s) and how far the ball rolls (m).
 BALL_PUSH_INTERVAL_S = (0.5, 3.0)
 BALL_PUSH_DISTANCE_RANGE = (0.05, 2.0)
@@ -695,6 +698,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "foot_body_names": (RIGHT_FOOT_SUBTREE, LEFT_FOOT_SUBTREE),
       "medial_signs": (1.0, -1.0),  # +Y medial for right, -Y medial for left (see rewards.py docstring).
       "window_s": KICK_WINDOW_S,
+      "min_ball_travel": KICK_MIN_BALL_TRAVEL,
       "dist_range": BALL_DIST_RANGE,
       "lateral_range": BALL_LATERAL_RANGE,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,

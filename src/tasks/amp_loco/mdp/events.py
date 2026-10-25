@@ -585,6 +585,10 @@ class kick_contact_cycle:
         env.kick_foot_correct = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env.kick_dir_world = _sample_kick_dir(env.num_envs, env.device)
         env.kick_intensity = sample_uniform(0.0, 1.0, (env.num_envs,), device=env.device)
+        # Ball xy at the moment of the last detected kick; the ball respawns
+        # at the end of the window only if it moved far enough from here.
+        env.kick_start_ball_xy = torch.zeros((env.num_envs, 2), device=env.device)
+        self._min_ball_travel = cfg.params.get("min_ball_travel", 0.0)
 
     def reset(self, env_ids) -> None:
         """No-op: this event has no instance state of its own that needs
@@ -645,11 +649,13 @@ class kick_contact_cycle:
         angle_threshold_deg: float = 20.0,
         right_ball_sensor_name: str = "r_foot_ball_contact",
         left_ball_sensor_name: str = "l_foot_ball_contact",
+        min_ball_travel: float = 0.0,
     ) -> None:
         del (
             env_ids, robot_cfg, ball_cfg, foot_body_names, medial_signs,
             impact_speed_threshold, window_s, dist_range, lateral_range, kick_dir_cone_deg,
             anchor_body_name, angle_threshold_deg, right_ball_sensor_name, left_ball_sensor_name,
+            min_ball_travel,
         )
         # All params unused here; resolved once in __init__.
 
@@ -696,6 +702,9 @@ class kick_contact_cycle:
             # a proper side-foot kick pays much more than a glancing one.
             style = torch.clamp(align, 0.0, 1.0) ** 2
             env.kick_style = torch.where(new_contact, style, env.kick_style)
+            env.kick_start_ball_xy = torch.where(
+                new_contact.unsqueeze(-1), ball_pos, env.kick_start_ball_xy
+            )
 
             # Foot correctness: which foot ACTUALLY struck the ball (the same
             # "closest configured foot" used for style, above) vs. which foot
@@ -719,6 +728,16 @@ class kick_contact_cycle:
         expiring = env.kick_timer == 1  # last active step of the window
         env.kick_timer = torch.clamp(env.kick_timer - 1, min=0)
 
+        if not expiring.any():
+            return
+        # The ball was touched (a kick needs a foot contact). It respawns only if
+        # it also moved at least ``min_ball_travel`` from where it was kicked.
+        # A weak tap ends the window without a respawn: the robot has to kick
+        # the same ball again.
+        travel = torch.norm(
+            self._ball.data.root_link_pos_w[:, :2] - env.kick_start_ball_xy, dim=-1
+        )
+        expiring = expiring & (travel >= self._min_ball_travel)
         if not expiring.any():
             return
         ids = expiring.nonzero(as_tuple=False).squeeze(-1)
