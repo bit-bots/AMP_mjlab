@@ -58,11 +58,11 @@ from src.tasks.amp_loco.mdp.terrain import (
 BALL_NAME = "ball"
 
 # Random ball nudges: interval per env (s) and how far the ball rolls (m).
-BALL_PUSH_INTERVAL_S = (10.0, 30.0)
+BALL_PUSH_INTERVAL_S = (0.5, 3.0)
 BALL_PUSH_DISTANCE_RANGE = (0.05, 2.0)
 # Horizontal distance (m) from base_link under which the ball counts as under
 # the robot.
-BALL_UNDER_BASE_RADIUS = 0.05
+BALL_UNDER_BASE_RADIUS = 0.08
 BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball.py)
 RIGHT_FOOT_SUBTREE = "r_ankle_roll_link"
 LEFT_FOOT_SUBTREE = "l_ankle_roll_link"
@@ -634,7 +634,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "min_dist": FOOT_BASE_MIN_DIST,
     },
   )
-  # Hefty penalty for the ball ending up under the robot (within 5 cm of the
+  # Hefty penalty for the ball ending up under the robot (within 8 cm of the
   # base_link projected onto the ground): a kick is impossible from there.
   cfg.rewards["ball_under_base"] = RewardTermCfg(
     func=amp_mdp.ball_under_base_penalty,
@@ -670,7 +670,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
     },
   )
-  # Random ball nudge every 10 to 30 s per env (not during the post-kick
+  # Random ball nudge every 0.5 to 3 s per env (not during the post-kick
   # window): rolls the ball from a few cm up to about 2 m, so the robot must
   # keep re-approaching a moving ball instead of waiting for the next reset.
   cfg.events["random_ball_push"] = EventTermCfg(
