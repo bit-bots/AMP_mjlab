@@ -42,7 +42,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.velocity.mdp.rewards import feet_air_time
 
-from src.assets.objects import BALL_GEOM_NAME, get_ball_cfg
+from src.assets.objects import BALL_GEOM_NAME, get_ball_cfg, get_ball_ghost_cfg
 from src.tasks.amp_loco import mdp as amp_mdp
 from src.tasks.amp_loco.config.piplus.env_cfgs import (
   ANCHOR_NAME,
@@ -63,9 +63,15 @@ KICK_MIN_BALL_TRAVEL = 0.3
 # Random ball nudges: interval per env (s) and how far the ball rolls (m).
 BALL_PUSH_INTERVAL_S = (0.5, 3.0)
 BALL_PUSH_DISTANCE_RANGE = (0.05, 2.0)
+# Actor ball position delay: up to 0.1 s (5 steps of 0.02 s), applied to the
+# world-frame position (see object_pos_b_noisy_delayed_world).
+BALL_OBS_MAX_LAG_STEPS = 5
+# No pushes before iteration 2000; the push chance then rises linearly to 1
+# at iteration 15000.
+BALL_PUSH_RAMP_ITERATIONS = (2_000, 15_000)
 # Horizontal distance (m) from base_link under which the ball counts as under
 # the robot.
-BALL_UNDER_BASE_RADIUS = 0.08
+BALL_UNDER_BASE_RADIUS = 0.05
 BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball.py)
 RIGHT_FOOT_SUBTREE = "r_ankle_roll_link"
 LEFT_FOOT_SUBTREE = "l_ankle_roll_link"
@@ -393,31 +399,26 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # Actor-only ball position noise (critic keeps ground truth): models a noisy
   # ball-tracking perception (e.g. vision) rather than perfect state. Jumps
-  # from 0.07m to 1.0m std during the post-kick phase (env.kick_timer > 0) --
+  # from 0.0175 m to 0.25 m std during the post-kick phase (env.kick_timer > 0) --
   # the real robot's vision loses good track of the ball right after a fast
   # kick (motion blur/high speed), not just a flat noise floor throughout.
   # Overrides the clean copy from the loop above (can't use the generic
   # per-term GaussianNoiseCfg here since the std needs to depend on
   # per-env kick-phase state).
   cfg.observations["actor"].terms["ball_pos_b"] = ObservationTermCfg(
-    func=amp_mdp.object_pos_b_noisy,
+    func=amp_mdp.object_pos_b_noisy_delayed_world,
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
-      "std": 0.07,
-      "std_post_kick": 1.0,
+      "std": 0.0175,
+      "std_post_kick": 0.25,
       # Range/bearing noise stacked on top of the isotropic std above (see
       # object_pos_b_noisy docstring) -- NOT env.kick_dir_world, just the
       # ball's own local-frame position treated as polar coordinates.
-      "range_noise_std": 0.2,
-      "bearing_noise_std_deg": 5.0,
+      "range_noise_std": 0.01,
+      "bearing_noise_std_deg": 2.0,
+      "max_lag": BALL_OBS_MAX_LAG_STEPS,
     },
-    # Actor-only random observation delay, up to 0.2s (step_dt=0.02s -> 10
-    # steps), re-sampled per env every step (mjlab's built-in delay pipeline,
-    # see ObservationTermCfg.delay_min_lag/delay_max_lag) -- models the ball
-    # position lagging behind a real perception pipeline. Critic keeps
-    # instantaneous ground truth.
-    delay_max_lag=10,
   )
   # Actor-only noisy kick-direction observation: Gaussian noise on the
   # underlying yaw angle (not the raw vector -- see kick_dir_heading_b_noisy
@@ -427,10 +428,10 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.observations["actor"].terms["kick_dir_b"] = ObservationTermCfg(
     func=amp_mdp.kick_dir_heading_b_noisy,
     params={"robot_cfg": SceneEntityCfg("robot"), "std_rad": math.radians(5.0)},
-    # Same random up-to-0.2s delay as ball_pos_b above -- delaying a buffered
+    # Random up-to-0.1s delay (5 steps), same as ball_pos_b above -- delaying a buffered
     # sequence of already-unit-norm vectors just returns an older valid one,
     # so this doesn't reintroduce the norm-corruption issue noise did.
-    delay_max_lag=10,
+    delay_max_lag=BALL_OBS_MAX_LAG_STEPS,
   )
 
   # --- Drop velocity-tracking rewards; add ball-approach + kick rewards ----
@@ -637,17 +638,6 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "min_dist": FOOT_BASE_MIN_DIST,
     },
   )
-  # Hefty penalty for the ball ending up under the robot (within 8 cm of the
-  # base_link projected onto the ground): a kick is impossible from there.
-  cfg.rewards["ball_under_base"] = RewardTermCfg(
-    func=amp_mdp.ball_under_base_penalty,
-    weight=-20.0,
-    params={
-      "ball_cfg": SceneEntityCfg(BALL_NAME),
-      "base_cfg": SceneEntityCfg("robot", body_names=(ROOT_NAME,)),
-      "radius": BALL_UNDER_BASE_RADIUS,
-    },
-  )
   # Discourage double-touching the ball with both feet: once one foot has
   # touched it first (this ball "life"), the other foot subsequently also
   # touching is penalized -- kicking should be a single clean strike with
@@ -683,6 +673,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "ball_cfg": SceneEntityCfg(BALL_NAME),
       "distance_range": BALL_PUSH_DISTANCE_RANGE,
+      "ramp_iterations": BALL_PUSH_RAMP_ITERATIONS,
     },
   )
   cfg.events["kick_contact_cycle"] = EventTermCfg(
@@ -797,6 +788,22 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # a play session has 1-few envs, so one fixed draw would last the whole
   # session. Resample every startup DR event on each reset instead.
   if play:
+    # Semi-transparent ghost ball at the position the actor observes (noise
+    # and delay included).
+    # PLAY_NO_BALL_NOISE=1 zeroes the actor's ball position noise (the delay
+    # stays) to look at a policy without perception noise.
+    if os.environ.get("PLAY_NO_BALL_NOISE") == "1":
+      _p = cfg.observations["actor"].terms["ball_pos_b"].params
+      _p.update(std=0.0, std_post_kick=0.0, range_noise_std=0.0, bearing_noise_std_deg=0.0)
+    cfg.scene.entities["ball_ghost"] = get_ball_ghost_cfg()
+    cfg.events["ball_obs_ghost"] = EventTermCfg(
+      func=amp_mdp.update_ball_obs_ghost,
+      mode="step",
+      params={
+        "ghost_cfg": SceneEntityCfg("ball_ghost"),
+        "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
+      },
+    )
     for _ev in cfg.events.values():
       if _ev.mode == "startup" and (
         "mdp.dr" in getattr(_ev.func, "__module__", "")

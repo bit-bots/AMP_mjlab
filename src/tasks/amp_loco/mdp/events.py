@@ -8,7 +8,11 @@ import torch
 from mjlab.entity import Entity
 from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.utils.lab_api.math import sample_uniform, subtract_frame_transforms
+from mjlab.utils.lab_api.math import (
+    quat_apply,
+    sample_uniform,
+    subtract_frame_transforms,
+)
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -448,6 +452,8 @@ def random_ball_push(
     env_ids: torch.Tensor,
     ball_cfg: SceneEntityCfg,
     distance_range: tuple[float, float] = (0.05, 2.0),
+    ramp_iterations: tuple[int, int] | None = None,
+    steps_per_iteration: int = 24,
 ) -> None:
     """Interval event: give the ball a random horizontal velocity so that it
     rolls about ``distance`` meters, with ``distance`` log-uniform in
@@ -461,9 +467,19 @@ def random_ball_push(
 
     Skipped while the post-kick window runs (``env.kick_timer`` > 0), so a push
     never disturbs the reward window of a kick.
+
+    Curriculum: with ``ramp_iterations=(start, end)`` no push happens before
+    iteration ``start``. From there the chance that a due push really happens
+    rises linearly to 1 at iteration ``end``. The iteration is
+    ``env.common_step_counter / steps_per_iteration``.
     """
     if hasattr(env, "kick_timer"):
         env_ids = env_ids[env.kick_timer[env_ids] == 0]
+    if ramp_iterations is not None:
+        start, end = ramp_iterations
+        iteration = env.common_step_counter / steps_per_iteration
+        scale = min(max((iteration - start) / (end - start), 0.0), 1.0)
+        env_ids = env_ids[torch.rand(env_ids.shape[0], device=env.device) < scale]
     n = env_ids.shape[0]
     if n == 0:
         return
@@ -745,3 +761,27 @@ class kick_contact_cycle:
             env, ids, self._robot, self._ball,
             self._dist_range, self._lateral_range, self._kick_dir_cone_deg,
         )
+
+
+def update_ball_obs_ghost(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    ghost_cfg: SceneEntityCfg,
+    anchor_cfg: SceneEntityCfg,
+) -> None:
+    """Step event (viewer only): move the mocap ghost ball to the ball position
+    that the actor observes (noise and delay included), in the world frame.
+
+    ``env.ball_obs_delayed_w`` is set by ``object_pos_b_noisy_delayed_world``.
+    It is one step old, as the observation manager runs after the events.
+    """
+    del env_ids, anchor_cfg
+    pos_w = getattr(env, "ball_obs_delayed_w", None)
+    if pos_w is None:
+        return
+    pose = torch.zeros((pos_w.shape[0], 7), device=pos_w.device)
+    pose[:, 0:3] = pos_w
+    pose[:, 3] = 1.0
+    env.scene[ghost_cfg.name].write_mocap_pose_to_sim(
+        pose, env_ids=torch.arange(pos_w.shape[0], device=pos_w.device)
+    )

@@ -62,3 +62,26 @@ def get_ball_cfg(
     init_state=EntityCfg.InitialStateCfg(pos=spawn_pos),
     spec_fn=_get_ball_spec,
   )
+
+
+BALL_GHOST_RGBA = (0.2, 0.9, 0.3, 0.4)  # semi-transparent green
+
+
+def _get_ball_ghost_spec() -> mujoco.MjSpec:
+  spec = mujoco.MjSpec()
+  body = spec.worldbody.add_body(name=BALL_BODY_NAME + "_ghost")
+  body.add_geom(
+    name=BALL_GEOM_NAME + "_ghost",
+    type=mujoco.mjtGeom.mjGEOM_SPHERE,
+    size=[BALL_RADIUS, 0.0, 0.0],
+    rgba=list(BALL_GHOST_RGBA),
+    contype=0,
+    conaffinity=0,
+  )
+  return spec
+
+
+def get_ball_ghost_cfg() -> EntityCfg:
+  """Fixed (mocap), non-colliding ball for the viewer: marks the ball position
+  that the actor observes (noise and delay included)."""
+  return EntityCfg(spec_fn=_get_ball_ghost_spec)

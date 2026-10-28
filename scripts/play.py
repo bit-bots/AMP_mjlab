@@ -1,6 +1,7 @@
 """Script to play RL agent with RSL-RL."""
 
 import os
+import re
 import inspect
 import sys
 from dataclasses import asdict, dataclass
@@ -214,6 +215,14 @@ def run_play(task_id: str, cfg: PlayConfig):
       "[WARN] Video recording with dummy agents is disabled (no checkpoint/log_dir)."
     )
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+
+  # Step-count curricula (for example the ball push ramp) read
+  # ``common_step_counter``. Set it to the checkpoint's training step so that
+  # play shows the curriculum stage the checkpoint was trained at.
+  if resume_path is not None:
+    match = re.fullmatch(r"model_(\d+)", resume_path.stem)
+    if match is not None:
+      env.common_step_counter = int(match.group(1)) * agent_cfg.num_steps_per_env
 
   if TRAINED_MODE and cfg.video:
     print("[INFO] Recording videos during play")

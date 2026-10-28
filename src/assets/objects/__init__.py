@@ -5,4 +5,5 @@ from .ball import (
   BALL_STRONG_RGBA as BALL_STRONG_RGBA,
   BALL_WEAK_RGBA as BALL_WEAK_RGBA,
   get_ball_cfg as get_ball_cfg,
+  get_ball_ghost_cfg as get_ball_ghost_cfg,
 )

@@ -12,6 +12,7 @@ from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   subtract_frame_transforms,
+  quat_apply,
   quat_apply_inverse,
 )
 
@@ -198,6 +199,48 @@ def object_pos_b_noisy(
         torch.full_like(pos_b[:, 0], std),
     )
     return pos_b + torch.randn_like(pos_b) * sigma.unsqueeze(-1)
+
+
+def object_pos_b_noisy_delayed_world(
+    env: ManagerBasedRlEnv,
+    object_cfg: SceneEntityCfg,
+    anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+    max_lag: int = 5,
+    **noise_kwargs,
+) -> torch.Tensor:
+    """Actor-only ball position: noisy (``object_pos_b_noisy``), delayed in the
+    WORLD frame, and then expressed in the CURRENT anchor frame.
+
+    Each step the noisy measurement is moved to the world frame with the anchor
+    pose of that step and stored. The observation is the stored world position
+    from ``lag`` steps ago, ``lag`` drawn per env and per step from
+    ``0..max_lag``, expressed with the anchor pose of now. A delay in the
+    anchor frame would instead drag the ball with the old robot pose, so a
+    turning robot would see a ball that is not where it really was. The
+    delayed world position is kept in ``env.ball_obs_delayed_w`` (viewer ghost).
+    The history is refilled with the current measurement after a reset.
+    """
+    anchor: Entity = env.scene[anchor_cfg.name]
+    anchor_pos_w = anchor.data.body_link_pos_w[:, anchor_cfg.body_ids[0]]
+    anchor_quat_w = anchor.data.body_link_quat_w[:, anchor_cfg.body_ids[0]]
+
+    pos_b = object_pos_b_noisy(env, object_cfg, anchor_cfg, **noise_kwargs)
+    pos_w = anchor_pos_w + quat_apply(anchor_quat_w, pos_b)
+
+    hist = getattr(env, "_ball_obs_hist_w", None)
+    if hist is None:
+        hist = pos_w.unsqueeze(1).repeat(1, max_lag + 1, 1)
+    hist = torch.roll(hist, shifts=1, dims=1)  # index k = k steps ago
+    hist[:, 0] = pos_w
+    fresh = env.episode_length_buf == 0
+    if fresh.any():
+        hist[fresh] = pos_w[fresh].unsqueeze(1)
+    env._ball_obs_hist_w = hist
+
+    lag = torch.randint(0, max_lag + 1, (pos_w.shape[0],), device=pos_w.device)
+    delayed_w = hist[torch.arange(pos_w.shape[0], device=pos_w.device), lag]
+    env.ball_obs_delayed_w = delayed_w
+    return quat_apply_inverse(anchor_quat_w, delayed_w - anchor_pos_w)
 
 
 def object_lin_vel_b(
