@@ -2,6 +2,7 @@
 
 import dataclasses
 import os
+from dataclasses import dataclass, field
 
 from mjlab.rl import RslRlModelCfg, RslRlPpoAlgorithmCfg
 
@@ -122,3 +123,52 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
     save_interval=500,
     max_iterations=30_000,  # was 100001; the kick policy converges (or breaks) well before
   )
+
+
+@dataclass
+class RslRlSymmetryCfg:
+  """Symmetry settings that rsl_rl PPO/AMPPPO read from ``symmetry_cfg``.
+
+  The mirror loss weight is 0.0 by default. Set it explicitly.
+  """
+
+  use_data_augmentation: bool = False
+  use_mirror_loss: bool = False
+  mirror_loss_coeff: float = 0.0
+  data_augmentation_func: str = ""
+
+
+@dataclass
+class RslRlAmpPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+  """PPO algorithm cfg with the rsl_rl symmetry option (mjlab has no field)."""
+
+  symmetry_cfg: RslRlSymmetryCfg | None = None
+
+
+@dataclass
+class RslRlAmpSymmetricRunnerCfg(RslRlAmpRunnerCfg):
+  algorithm: RslRlAmpPpoAlgorithmCfg = field(default_factory=RslRlAmpPpoAlgorithmCfg)
+
+
+def piplus_amp_kick_ppo_symmetric_runner_cfg() -> RslRlAmpSymmetricRunnerCfg:
+  """Kick runner with left/right symmetry in PPO (as the piplus_amp_mjlab
+  "Flat-Amp-DA" task): mirrored samples go into each PPO mini-batch, and the
+  mirror loss (weight 1.0) pulls actor(mirror(obs)) to mirror(actor(obs)).
+  All other settings are the same as ``piplus_amp_kick_ppo_runner_cfg``. The
+  AMP reference data (KickAndRun/) already has a mirrored copy of each clip.
+  """
+  base = piplus_amp_kick_ppo_runner_cfg()
+  algorithm = RslRlAmpPpoAlgorithmCfg(
+    **dataclasses.asdict(base.algorithm),
+    symmetry_cfg=RslRlSymmetryCfg(
+      use_data_augmentation=True,
+      use_mirror_loss=True,
+      mirror_loss_coeff=1.0,
+      data_augmentation_func=(
+        "src.tasks.amp_loco.config.piplus.kick_symmetry:augment_symmetries_piplus_kick"
+      ),
+    ),
+  )
+  fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
+  fields.update(algorithm=algorithm, experiment_name="piplus_amp_kick_symmetric")
+  return RslRlAmpSymmetricRunnerCfg(**fields)

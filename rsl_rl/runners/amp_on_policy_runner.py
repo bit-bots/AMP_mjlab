@@ -156,9 +156,12 @@ class AmpOnPolicyRunner:
             self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
 
         # if using symmetry then pass the environment config object
-        if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
+        # Give the env to a copy of symmetry_cfg only. The train script dumps
+        # self.alg_cfg to agent.yaml, and the env object cannot be dumped.
+        alg_kwargs = dict(self.alg_cfg)
+        if alg_kwargs.get("symmetry_cfg") is not None:
             # this is used by the symmetry function for handling different observation terms
-            self.alg_cfg["symmetry_cfg"]["_env"] = env
+            alg_kwargs["symmetry_cfg"] = {**alg_kwargs["symmetry_cfg"], "_env": env}
 
         # init amp loader
         # Resolve all body names from the environment's robot entity
@@ -204,6 +207,7 @@ class AmpOnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
+        alg_kwargs.pop("class_name")
         self.alg: AMPPPO = alg_class(
             policy,
             discriminator,
@@ -211,7 +215,7 @@ class AmpOnPolicyRunner:
             amp_normalizer,
             device=self.device,
             min_std=min_std,
-            **self.alg_cfg,
+            **alg_kwargs,
             multi_gpu_cfg=self.multi_gpu_cfg,
         )
 
