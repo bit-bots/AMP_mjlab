@@ -385,6 +385,138 @@ def move_toward_object(
   return speed * signed_align
 
 
+def _smoothstep(a: float, b: float, x: torch.Tensor) -> torch.Tensor:
+  t = torch.clamp((x - a) / (b - a), 0.0, 1.0)
+  return t * t * (3.0 - 2.0 * t)
+
+
+def approach_field(
+  p: torch.Tensor,
+  slot_back: float,
+  slot_lateral: float,
+  keepout_radius: float,
+  softness: float,
+  circle_fade: float,
+  lane_half_width: float,
+  lane_strength: float,
+  lane_behind_gain: float,
+  max_speed: float,
+  keepout_push: float = 1.5,
+  swirl: float = 1.0,
+  swirl_width: float = 0.25,
+) -> torch.Tensor:
+  """Base velocity field for the approach to the ball, in the ball frame.
+
+  ``p``: (N, 2) base position, ball at the origin, kick direction = +x, +y to
+  its left. Returns the velocity ``(N, 2)`` in the same frame.
+
+  The field has two mirrored slots at ``(-slot_back, +/-slot_lateral)``. A
+  robot goes to the slot on its own side of the kick line. The field is the
+  sum of three terms, normalised, with the speed set by the distance to the
+  slot:
+
+  1. Attraction: a unit vector toward the own-side slot.
+  2. Keep-out circle around the ball (radius ``max(keepout_radius, |slot|)``,
+     so the slot may lie inside it): a push-out that grows inside the circle
+     over ``softness``, and a swirl around the ball toward the slot angle. Both
+     fade out over ``circle_fade`` rad before the slot angle and are off behind
+     it, so the robot can go in to the slot.
+  3. Keep-out line along the kick direction: a sideways push to the own side
+     inside a lane of half-width ``lane_half_width``, reduced by
+     ``lane_behind_gain`` behind the ball.
+
+  Same maths as the "Ball Approach Field" web viewer.
+  """
+  x = p[:, 0]
+  y = p[:, 1]
+  sg = torch.where(y >= 0.0, 1.0, -1.0)
+  ya = y.abs()
+  slot_r = math.hypot(slot_back, slot_lateral)
+  ring = max(keepout_radius, slot_r)
+  r = torch.clamp(torch.hypot(x, ya), min=1e-6)
+  ux, uy = x / r, ya / r
+  th = torch.atan2(ya, x)
+  thg = math.atan2(slot_lateral, -slot_back)
+
+  # 1. Attraction to the own-side slot.
+  gx_, gy_ = -slot_back, slot_lateral
+  dg = torch.hypot(gx_ - x, gy_ - ya)
+  ax = (gx_ - x) / torch.clamp(dg, min=1e-6)
+  ay = (gy_ - ya) / torch.clamp(dg, min=1e-6)
+
+  # 2. Keep-out circle: push-out and swirl.
+  act = 1.0 - _smoothstep(thg - circle_fade, thg, th)
+  rho = keepout_push * _smoothstep(ring + softness, ring, r) * act
+  swirl_dir = torch.tanh(4.0 * (torch.remainder(thg - th + math.pi, 2.0 * math.pi) - math.pi))
+  bump = torch.exp(-(((r - ring) / swirl_width) ** 2)) * act
+  cx = ux * rho + (-uy) * swirl_dir * swirl * bump
+  cy = uy * rho + ux * swirl_dir * swirl * bump
+
+  # 3. Keep-out line.
+  behind_gain = lane_behind_gain + (1.0 - lane_behind_gain) * _smoothstep(-0.3, 0.1, x)
+  line_y = lane_strength * behind_gain * torch.exp(-((ya / lane_half_width) ** 2)) * torch.tanh(ya / 0.08)
+
+  vx = ax + cx
+  vy = ay + cy + line_y
+  n = torch.clamp(torch.hypot(vx, vy), min=1e-6)
+  c1 = min(0.30, 0.6 * slot_r)
+  speed = max_speed * torch.clamp(dg / c1, max=1.0)
+  return torch.stack([vx / n * speed, sg * vy / n * speed], dim=-1)
+
+
+def move_along_approach_field(
+  env: ManagerBasedRlEnv,
+  object_cfg: SceneEntityCfg,
+  anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+  slot_back: float = 0.05,
+  slot_lateral: float = 0.12,
+  keepout_radius: float = 0.30,
+  softness: float = 0.15,
+  circle_fade: float = 0.6,
+  lane_half_width: float = 0.40,
+  lane_strength: float = 1.0,
+  lane_behind_gain: float = 0.35,
+  max_speed: float = 1.0,
+  keepout_push: float = 1.5,
+  swirl: float = 1.0,
+  swirl_width: float = 0.25,
+) -> torch.Tensor:
+  """Reward the anchor's velocity along the approach field (see
+  ``approach_field``).
+
+  The field lives in the ball frame with the target kick direction
+  (``env.kick_dir_world``) as +x, taken at the anchor's position. reward =
+  ``min(v . u, |field speed|)`` with ``u`` the unit field direction: speed
+  along the field is paid up to the field's own speed (which falls to zero at
+  the slot), and motion against the field is penalized linearly. Uses the
+  anchor's linear velocity, so turning in place earns nothing.
+  """
+  robot: Entity = env.scene[anchor_cfg.name]
+  ball: Entity = env.scene[object_cfg.name]
+  kick_dir = getattr(env, "kick_dir_world", None)
+  if kick_dir is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  kick_dir = kick_dir / (torch.norm(kick_dir, dim=-1, keepdim=True) + 1e-6)
+  rel = robot.data.body_link_pos_w[:, anchor_cfg.body_ids[0], :2] - ball.data.root_link_pos_w[:, :2]
+  # World to ball frame: x along the kick direction, y = 90 deg to its left.
+  px = rel[:, 0] * kick_dir[:, 0] + rel[:, 1] * kick_dir[:, 1]
+  py = -rel[:, 0] * kick_dir[:, 1] + rel[:, 1] * kick_dir[:, 0]
+  v_field = approach_field(
+    torch.stack([px, py], dim=-1),
+    slot_back, slot_lateral, keepout_radius, softness, circle_fade,
+    lane_half_width, lane_strength, lane_behind_gain, max_speed,
+    keepout_push, swirl, swirl_width,
+  )
+  field_speed = torch.norm(v_field, dim=-1)
+  u = v_field / torch.clamp(field_speed, min=1e-6).unsqueeze(-1)
+  # Robot velocity into the ball frame.
+  vel = robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2]
+  vx = vel[:, 0] * kick_dir[:, 0] + vel[:, 1] * kick_dir[:, 1]
+  vy = -vel[:, 0] * kick_dir[:, 1] + vel[:, 1] * kick_dir[:, 0]
+  along = vx * u[:, 0] + vy * u[:, 1]
+  return torch.minimum(along, field_speed)
+
+
 def torso_orient_to_object(
   env: ManagerBasedRlEnv,
   object_cfg: SceneEntityCfg,

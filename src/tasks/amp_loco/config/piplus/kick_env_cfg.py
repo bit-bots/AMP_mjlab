@@ -131,20 +131,27 @@ BALL_SLIDING_FRICTION_RANGE = (0.1, 1.6)
 BALL_ROLLING_FRICTION_RANGE = (0.01, 0.1)
 BALL_TORSIONAL_FRICTION_RANGE = (0.001, 0.1)
 
-# Ball spawn/respawn geometry: forward distance from the robot + a
-# distance-scaled lateral offset (see _place_ball_near_robot, mdp/events.py)
-# -- always somewhere in front of the robot, narrower close-in and wider
-# further out. Replaces an earlier design that walked the robot to a
-# structured "approach point" behind the ball before allowing contact; that
-# extra state machine was dropped as unnecessary -- the ordinary
-# move_to_ball/torso_orient_to_ball rewards already handle getting the robot
-# to the ball without it.
+# Ball spawn/respawn geometry (see _place_ball_near_robot, mdp/events.py): the
+# distance comes from BALL_DIST_RANGE, the bearing is uniform around the robot
+# (+/- BALL_ANGLE_RANGE_DEG from its heading; 180 = anywhere, also behind it).
 BALL_DIST_RANGE = (0.3, 1.0)
-BALL_LATERAL_RANGE = (0.2, 0.7)  # (near, far) lateral half-width, meters.
+BALL_ANGLE_RANGE_DEG = 180.0
 # Target kick direction sampled within the robot's heading at spawn time +/-
-# this cone -- a direction the robot has a plausible chance of actually
-# hitting from its current orientation, rather than a fully arbitrary one.
-KICK_DIR_CONE_DEG = 80.0
+# this cone. 180 = any direction.
+KICK_DIR_CONE_DEG = 180.0
+# Approach field for the go-to-ball reward (mdp/rewards.py approach_field,
+# same maths as the "Ball Approach Field" web viewer): two mirrored slots
+# behind the ball, 5 cm behind and 12 cm to each side of the kick line, inside
+# a 30 cm keep-out circle around the ball.
+APPROACH_SLOT_BACK = 0.05
+APPROACH_SLOT_LATERAL = 0.12
+APPROACH_KEEPOUT_RADIUS = 0.30
+APPROACH_KEEPOUT_SOFTNESS = 0.15
+APPROACH_CIRCLE_FADE = 0.6
+APPROACH_LANE_HALF_WIDTH = 0.40
+APPROACH_LANE_STRENGTH = 1.0
+APPROACH_LANE_BEHIND_GAIN = 0.35
+APPROACH_MAX_SPEED = 1.0
 # Kick intensity (env.kick_intensity, see kick_contact_cycle) is now a
 # continuous command in [0, 1], resampled uniformly for every ball "life" and
 # mapped to a target ball speed by kick_intensity_to_target_speed
@@ -439,19 +446,27 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards.pop(name, None)
   # History: 1.0 -> 5.0 -> 12.0 -> 6.0 -> 12.0 -> 6.0 -> 4.0 -> 6.0 -> 4.0 --
   # simplified back to a direct move-toward-the-ball reward (no more
-  # structured "approach point" state, see BALL_DIST_RANGE/BALL_LATERAL_RANGE
+  # structured "approach point" state, see BALL_DIST_RANGE/BALL_ANGLE_RANGE_DEG
   # above) now that kick_contact_cycle no longer gates contact on a
   # position/orientation "ready" state -- the robot may kick as soon as it
   # reaches the ball, so there's nothing left for an approach point to set up.
+  # Now scored against the approach field (two slots behind the ball, see
+  # APPROACH_SLOT_* above) instead of the straight line to the ball.
   cfg.rewards["move_to_ball"] = RewardTermCfg(
-    func=amp_mdp.move_toward_object,
+    func=amp_mdp.move_along_approach_field,
     weight=4.0,
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
-      "adaptive_foot_offset": KICK_APPROACH_OFFSET_MAGNITUDE,
-      "foot_select_angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
-      "alignment_power": 3.0,
+      "slot_back": APPROACH_SLOT_BACK,
+      "slot_lateral": APPROACH_SLOT_LATERAL,
+      "keepout_radius": APPROACH_KEEPOUT_RADIUS,
+      "softness": APPROACH_KEEPOUT_SOFTNESS,
+      "circle_fade": APPROACH_CIRCLE_FADE,
+      "lane_half_width": APPROACH_LANE_HALF_WIDTH,
+      "lane_strength": APPROACH_LANE_STRENGTH,
+      "lane_behind_gain": APPROACH_LANE_BEHIND_GAIN,
+      "max_speed": APPROACH_MAX_SPEED,
     },
   )
   # Significant flat penalty for standing still before the ball's been
@@ -554,7 +569,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # just under-rewarded, it goes negative once outside the tolerance cone.
   cfg.rewards["kick_impact"] = RewardTermCfg(
     func=amp_mdp.kick_impact_reward,
-    weight=10.0,
+    weight=20.0,
     params={
       "ball_cfg": SceneEntityCfg(BALL_NAME),
       "vel_weight": 2.0,
@@ -659,7 +674,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "robot_cfg": SceneEntityCfg("robot"),
       "ball_cfg": SceneEntityCfg(BALL_NAME),
       "dist_range": BALL_DIST_RANGE,
-      "lateral_range": BALL_LATERAL_RANGE,
+      "angle_range_deg": BALL_ANGLE_RANGE_DEG,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
     },
   )
@@ -691,7 +706,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "window_s": KICK_WINDOW_S,
       "min_ball_travel": KICK_MIN_BALL_TRAVEL,
       "dist_range": BALL_DIST_RANGE,
-      "lateral_range": BALL_LATERAL_RANGE,
+      "angle_range_deg": BALL_ANGLE_RANGE_DEG,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
       "anchor_body_name": ANCHOR_NAME,
       "angle_threshold_deg": KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG,
@@ -734,9 +749,19 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.curriculum["bump_control_penalties"] = CurriculumTermCfg(
     func=amp_mdp.bump_reward_weight_at_step,
     params={
-      "reward_names": ["joint_torques_l2", "action_rate_l2"],
+      "reward_names": ["joint_torques_l2"],
       "step": 3000 * 24,
       "scale": 4.0,
+    },
+  )
+  # Action-rate penalty in three stages: base -0.01, x4 at iteration 3000 (as
+  # for the torque penalty above), and x8 at iteration 10000 (-0.08, twice the
+  # old final value). The late stage comes after kicking is established.
+  cfg.curriculum["stage_action_rate"] = CurriculumTermCfg(
+    func=amp_mdp.stage_reward_weight_scale,
+    params={
+      "reward_names": ["action_rate_l2"],
+      "stages": [(3000 * 24, 4.0), (10000 * 24, 8.0)],
     },
   )
   # Completely drop ball_kick_contact's one-shot reward at iteration 2000 --

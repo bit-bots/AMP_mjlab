@@ -26,6 +26,27 @@ def _base_weight(term_cfg) -> float:
   return term_cfg._curriculum_base_weight
 
 
+def stage_reward_weight_scale(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  reward_names: list[str],
+  stages: list[tuple[int, float]],
+) -> torch.Tensor:
+  """Hard step-changes with several stages. ``stages`` is a list of
+  (step, scale). Once ``env.common_step_counter`` passes a step, the reward
+  weights are the original weight times that stage's scale (the last passed
+  stage wins). Before the first step the original weight holds."""
+  del env_ids
+  scale = 1.0
+  for step, stage_scale in stages:
+    if env.common_step_counter >= step:
+      scale = stage_scale
+  for name in reward_names:
+    term_cfg = env.reward_manager.get_term_cfg(name)
+    term_cfg.weight = _base_weight(term_cfg) * scale
+  return torch.tensor(scale)
+
+
 def fade_reward_weights_linear(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,

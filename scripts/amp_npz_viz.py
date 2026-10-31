@@ -128,6 +128,11 @@ def main() -> None:
     bpw, bqw, _ = get(name)
     fr = min(fr, bpw.shape[0] - 1)
     for npz_idx, gpos, gquat, h in handles:
+      if npz_idx >= bpw.shape[1]:
+        # Older npz files have fewer bodies than the current model.
+        h.visible = False
+        continue
+      h.visible = True
       bp = bpw[fr, npz_idx]
       Rb = R.from_quat(bqw[fr, npz_idx][[1, 2, 3, 0]])
       wpos = bp + Rb.apply(gpos)

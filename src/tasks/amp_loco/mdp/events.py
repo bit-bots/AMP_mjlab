@@ -328,7 +328,7 @@ def _place_ball_near_robot(
     robot: Entity,
     ball: Entity,
     dist_range: tuple[float, float],
-    lateral_range: tuple[float, float],
+    angle_range_deg: float,
     kick_dir_cone_deg: float,
 ) -> None:
     n = env_ids.shape[0]
@@ -336,20 +336,11 @@ def _place_ball_near_robot(
     robot_yaw = robot.data.heading_w[env_ids]
 
     dist = sample_uniform(dist_range[0], dist_range[1], (n,), device=env.device)
-    # Lateral spread scales linearly with forward distance: narrow
-    # (+/- lateral_range[0]) right in front of the robot, wide
-    # (+/- lateral_range[1]) at the far end of dist_range.
-    span = dist_range[1] - dist_range[0]
-    t = (dist - dist_range[0]) / span if span > 0 else torch.zeros_like(dist)
-    width = lateral_range[0] + t * (lateral_range[1] - lateral_range[0])
-    side = sample_uniform(-1.0, 1.0, (n,), device=env.device) * width
-
-    # forward/right in world xy, from the robot's current heading. -Y in the
-    # robot's local frame is "right" (matches foot_medial_alignment's
-    # convention elsewhere), so right_world = R(yaw) @ (0,-1) = (sin,-cos).
-    forward = torch.stack([torch.cos(robot_yaw), torch.sin(robot_yaw)], dim=-1)
-    right = torch.stack([torch.sin(robot_yaw), -torch.cos(robot_yaw)], dim=-1)
-    offset = forward * dist.unsqueeze(-1) + right * side.unsqueeze(-1)
+    # Bearing from the robot's heading, uniform in +/- angle_range_deg (180 =
+    # anywhere around the robot, including behind it).
+    half = math.radians(angle_range_deg)
+    bearing = robot_yaw + sample_uniform(-half, half, (n,), device=env.device)
+    offset = torch.stack([torch.cos(bearing), torch.sin(bearing)], dim=-1) * dist.unsqueeze(-1)
 
     # Ground level is BALL_RADIUS above the robot's own terrain patch
     # baseline (env_origins' z), not a fixed world z=0 -- a non-flat terrain
@@ -412,11 +403,12 @@ def reset_ball_near_robot(
     robot_cfg: SceneEntityCfg,
     ball_cfg: SceneEntityCfg,
     dist_range: tuple[float, float] = (0.3, 1.0),
-    lateral_range: tuple[float, float] = (0.2, 0.7),
-    kick_dir_cone_deg: float = 80.0,
+    angle_range_deg: float = 180.0,
+    kick_dir_cone_deg: float = 180.0,
 ) -> None:
-    """Reset event: spawn the ball in front of the robot (forward distance +
-    distance-scaled lateral offset, see ``_place_ball_near_robot``).
+    """Reset event: spawn the ball around the robot (distance from ``dist_range``,
+    bearing within +/- ``angle_range_deg`` of the heading, see
+    ``_place_ball_near_robot``).
 
     Must run AFTER any reset event that repositions the robot (e.g.
     ``reset_from_motion_data``) -- ``EntityData`` documents that write_* calls
@@ -432,7 +424,7 @@ def reset_ball_near_robot(
     env.sim.forward()
     robot: Entity = env.scene[robot_cfg.name]
     ball: Entity = env.scene[ball_cfg.name]
-    _place_ball_near_robot(env, env_ids, robot, ball, dist_range, lateral_range, kick_dir_cone_deg)
+    _place_ball_near_robot(env, env_ids, robot, ball, dist_range, angle_range_deg, kick_dir_cone_deg)
     if hasattr(env, "kick_timer"):
         env.kick_timer[env_ids] = 0
     if hasattr(env, "kick_style"):
@@ -586,7 +578,7 @@ class kick_contact_cycle:
         window_s = cfg.params.get("window_s", 2.0)
         self._window_steps = max(1, round(window_s / env.step_dt))
         self._dist_range = cfg.params.get("dist_range", (0.3, 1.0))
-        self._lateral_range = cfg.params.get("lateral_range", (0.2, 0.7))
+        self._angle_range_deg = cfg.params.get("angle_range_deg", 180.0)
         self._kick_dir_cone_deg = cfg.params.get("kick_dir_cone_deg", 80.0)
         anchor_body_name = cfg.params.get("anchor_body_name", "torso_link")
         self._anchor_body_id = self._robot.find_bodies(anchor_body_name)[0][0]
@@ -659,8 +651,8 @@ class kick_contact_cycle:
         impact_speed_threshold: float = 0.2,
         window_s: float = 2.0,
         dist_range: tuple[float, float] = (0.3, 1.0),
-        lateral_range: tuple[float, float] = (0.2, 0.7),
-        kick_dir_cone_deg: float = 80.0,
+        angle_range_deg: float = 180.0,
+        kick_dir_cone_deg: float = 180.0,
         anchor_body_name: str = "torso_link",
         angle_threshold_deg: float = 20.0,
         right_ball_sensor_name: str = "r_foot_ball_contact",
@@ -669,7 +661,7 @@ class kick_contact_cycle:
     ) -> None:
         del (
             env_ids, robot_cfg, ball_cfg, foot_body_names, medial_signs,
-            impact_speed_threshold, window_s, dist_range, lateral_range, kick_dir_cone_deg,
+            impact_speed_threshold, window_s, dist_range, angle_range_deg, kick_dir_cone_deg,
             anchor_body_name, angle_threshold_deg, right_ball_sensor_name, left_ball_sensor_name,
             min_ball_travel,
         )
@@ -759,7 +751,7 @@ class kick_contact_cycle:
         ids = expiring.nonzero(as_tuple=False).squeeze(-1)
         _place_ball_near_robot(
             env, ids, self._robot, self._ball,
-            self._dist_range, self._lateral_range, self._kick_dir_cone_deg,
+            self._dist_range, self._angle_range_deg, self._kick_dir_cone_deg,
         )
 
 
