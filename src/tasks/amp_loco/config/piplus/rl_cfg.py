@@ -136,6 +136,9 @@ class RslRlSymmetryCfg:
   use_mirror_loss: bool = False
   mirror_loss_coeff: float = 0.0
   data_augmentation_func: str = ""
+  # None: the mirror loss is the MSE. A float: the mirror loss is the Huber
+  # loss with this delta on each element (bounded gradient).
+  mirror_loss_huber_delta: float | None = None
 
 
 @dataclass
@@ -143,6 +146,9 @@ class RslRlAmpPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   """PPO algorithm cfg with the rsl_rl symmetry option (mjlab has no field)."""
 
   symmetry_cfg: RslRlSymmetryCfg | None = None
+  # None: no limit. A float: AMPPPO skips a mini-batch if its total loss,
+  # value loss or mirror loss is larger than this value or not finite.
+  skip_batch_loss_threshold: float | None = None
 
 
 @dataclass
@@ -170,5 +176,11 @@ def piplus_amp_kick_ppo_symmetric_runner_cfg() -> RslRlAmpSymmetricRunnerCfg:
     ),
   )
   fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
-  fields.update(algorithm=algorithm, experiment_name="piplus_amp_kick_symmetric")
+  # Rollout diagnostics are on for this task only, to find the source of the
+  # numerical blow-ups (see rsl_rl/utils/obs_diagnostics.py).
+  fields.update(
+    algorithm=algorithm,
+    experiment_name="piplus_amp_kick_symmetric",
+    obs_diagnostics=True,
+  )
   return RslRlAmpSymmetricRunnerCfg(**fields)

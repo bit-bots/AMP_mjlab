@@ -29,6 +29,22 @@ class RslRlAmpRunnerCfg(RslRlOnPolicyRunnerCfg):
   min_normalized_std: List[float] = field(default_factory=lambda: [0.05] * 29)
   amp_body_names: tuple = ()
   amp_anchor_name: str = ""
+  # Rollout diagnostics (rsl_rl/utils/obs_diagnostics.py). If True, the runner
+  # logs the max abs value of each obs term as "Diag/..." scalars and writes
+  # the env state of extreme envs to <run_dir>/extreme_states.jsonl.
+  obs_diagnostics: bool = False
+  # An env is "extreme" if a raw obs value (actor, critic or AMP) is larger
+  # than obs_diag_obs_threshold, or an action is larger than
+  # obs_diag_action_threshold, or a reward term is larger than
+  # obs_diag_reward_threshold (all as abs values). The reward values are the
+  # reward manager step rewards (weighted, not scaled by dt).
+  # Typical max abs values (Pi Plus kick, checkpoint 3000, 64 envs, 10
+  # iterations): obs 57 (joint_vel), actions 29, rewards 222 (total).
+  obs_diag_obs_threshold: float = 500.0
+  obs_diag_action_threshold: float = 200.0
+  obs_diag_reward_threshold: float = 5000.0
+  # Max number of JSON lines in extreme_states.jsonl for each run.
+  obs_diag_max_events: int = 200
 
 
 def g1_amp_ppo_runner_cfg() -> RslRlAmpRunnerCfg:

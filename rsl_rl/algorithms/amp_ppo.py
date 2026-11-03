@@ -63,6 +63,8 @@ class AMPPPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Skip a mini-batch if a loss is larger than this value (None: no limit)
+        skip_batch_loss_threshold: float | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         share_cnn_encoders=False,
@@ -148,6 +150,18 @@ class AMPPPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.skip_batch_loss_threshold = skip_batch_loss_threshold
+        # Show the settings that the update uses
+        if self.symmetry is not None:
+            print(
+                f"[AMPPPO] symmetry: use_data_augmentation={self.symmetry['use_data_augmentation']},"
+                f" use_mirror_loss={self.symmetry['use_mirror_loss']},"
+                f" mirror_loss_coeff={self.symmetry['mirror_loss_coeff']},"
+                f" mirror_loss_huber_delta={self.symmetry.get('mirror_loss_huber_delta')}"
+            )
+        print(f"[AMPPPO] skip_batch_loss_threshold={self.skip_batch_loss_threshold}")
+        # Diagnostic values of the last update. The runner logs them as "Diag/<key>".
+        self.diag_stats: dict[str, float] = {}
 
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
@@ -241,7 +255,22 @@ class AMPPPO:
         else:
             mean_symmetry_loss = None
         skipped_non_finite_batches = 0
+        skipped_loss_threshold_batches = 0
+        # Mini-batches with a non-finite total loss (after the mirror loss) that
+        # the optimizer used. This occurs only if skip_batch_loss_threshold is None.
+        applied_non_finite_loss_batches = 0
         effective_updates = 0
+        # Diagnostics: max values over all mini-batches (also skipped ones)
+        diag_max = {
+            "max_abs_advantage": 0.0,
+            "max_abs_return": 0.0,
+            "max_abs_value_target": 0.0,
+            "max_ratio_original": 0.0,
+        }
+        if self.symmetry:
+            diag_max["max_mirror_loss"] = 0.0
+            if self.symmetry["use_data_augmentation"]:
+                diag_max["max_ratio_mirrored"] = 0.0
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -286,6 +315,14 @@ class AMPPPO:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
+            # Diagnostics of the original (not mirrored) samples
+            with torch.no_grad():
+                diag_batch = {
+                    "max_abs_advantage": advantages_batch.abs().max(),
+                    "max_abs_return": returns_batch.abs().max(),
+                    "max_abs_value_target": target_values_batch.abs().max(),
+                }
+
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 # augmentation using symmetry
@@ -314,8 +351,16 @@ class AMPPPO:
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            # Ratio of the new and the old action probability, for diagnostics.
+            # The mirrored half uses the log-probs of the original actions.
+            with torch.no_grad():
+                ratio_diag = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                diag_batch["max_ratio_original"] = ratio_diag[:original_batch_size].max()
+                if num_aug > 1:
+                    diag_batch["max_ratio_mirrored"] = ratio_diag[original_batch_size:].max()
             if not torch.isfinite(returns_batch).all() or not torch.isfinite(value_batch).all():
                 skipped_non_finite_batches += 1
+                self._update_diag_max(diag_max, diag_batch)
                 continue
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
@@ -381,11 +426,13 @@ class AMPPPO:
 
             if not torch.isfinite(value_loss):
                 skipped_non_finite_batches += 1
+                self._update_diag_max(diag_max, diag_batch)
                 continue
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             if not torch.isfinite(loss):
                 skipped_non_finite_batches += 1
+                self._update_diag_max(diag_max, diag_batch)
                 continue
 
             # Symmetry loss
@@ -400,28 +447,35 @@ class AMPPPO:
                     # compute number of augmentations per sample
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                # actions predicted by the actor for symmetrically-augmented observations
-                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+                # If the mirror loss is off, compute it only as a metric (no gradient).
+                with torch.set_grad_enabled(self.symmetry["use_mirror_loss"]):
+                    # actions predicted by the actor for symmetrically-augmented observations
+                    mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
 
-                # compute the symmetrically augmented actions
-                # note: we are assuming the first augmentation is the original one.
-                #   We do not use the action_batch from earlier since that action was sampled from the distribution.
-                #   However, the symmetry loss is computed using the mean of the distribution.
-                action_mean_orig = mean_actions_batch[:original_batch_size]
-                _, actions_mean_symm_batch = data_augmentation_func(
-                    obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
-                )
+                    # compute the symmetrically augmented actions
+                    # note: we are assuming the first augmentation is the original one.
+                    #   We do not use the action_batch from earlier since that action was sampled from the distribution.
+                    #   However, the symmetry loss is computed using the mean of the distribution.
+                    action_mean_orig = mean_actions_batch[:original_batch_size]
+                    _, actions_mean_symm_batch = data_augmentation_func(
+                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                    )
 
-                # compute the loss (we skip the first augmentation as it is the original one)
-                mse_loss = torch.nn.MSELoss()
-                symmetry_loss = mse_loss(
-                    mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
-                )
+                    # compute the loss (we skip the first augmentation as it is the original one)
+                    # MSE (default) or Huber loss with delta on each element (bounded gradient)
+                    huber_delta = self.symmetry.get("mirror_loss_huber_delta")
+                    symm_pred = mean_actions_batch[original_batch_size:]
+                    symm_target = actions_mean_symm_batch.detach()[original_batch_size:]
+                    if huber_delta is None:
+                        symmetry_loss = torch.nn.functional.mse_loss(symm_pred, symm_target)
+                    else:
+                        symmetry_loss = torch.nn.functional.huber_loss(symm_pred, symm_target, delta=huber_delta)
                 # add the loss to the total loss
                 if self.symmetry["use_mirror_loss"]:
                     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
+                diag_batch["max_mirror_loss"] = symmetry_loss.detach()
 
             # Random Network Distillation loss
             if self.rnd:
@@ -448,6 +502,21 @@ class AMPPPO:
             amp_loss = 0.5 * (expert_loss + policy_loss)
             grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10)
             loss += self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
+            self._update_diag_max(diag_max, diag_batch)
+
+            # Skip the mini-batch if a loss is too large or not finite (optional)
+            if self.skip_batch_loss_threshold is not None:
+                check_losses = [loss, value_loss]
+                if self.symmetry:
+                    check_losses.append(symmetry_loss)
+                if not all(torch.isfinite(x) for x in check_losses):
+                    skipped_non_finite_batches += 1
+                    continue
+                if any(x > self.skip_batch_loss_threshold for x in check_losses):
+                    skipped_loss_threshold_batches += 1
+                    continue
+            elif not torch.isfinite(loss):
+                applied_non_finite_loss_batches += 1
 
             # Compute the gradients
             # -- For PPO
@@ -542,13 +611,26 @@ class AMPPPO:
             "amp_policy_pred": mean_policy_pred,
             "amp_expert_pred": mean_expert_pred,
             "skipped_non_finite_batches": float(skipped_non_finite_batches),
+            "skipped_loss_threshold_batches": float(skipped_loss_threshold_batches),
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
 
+        self.diag_stats = dict(diag_max)
+        self.diag_stats["applied_non_finite_loss_batches"] = float(applied_non_finite_loss_batches)
+
         return loss_dict
+
+    @staticmethod
+    def _update_diag_max(diag_max: dict, diag_batch: dict):
+        """Keep the max of each diagnostic value over the mini-batches."""
+        for key, value in diag_batch.items():
+            value = float(value)
+            # A NaN value stays NaN in the log, so that it is visible.
+            if value != value or value > diag_max[key]:
+                diag_max[key] = value
 
     """
     Helper functions

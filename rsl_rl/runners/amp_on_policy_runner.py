@@ -37,6 +37,7 @@ from rsl_rl.modules import (
     StudentTeacherRecurrent,
 )
 from rsl_rl.utils import AMPLoader, Normalizer, store_code_state
+from rsl_rl.utils.obs_diagnostics import ObsDiagnostics
 
 
 def _migrate_train_cfg(train_cfg: dict) -> None:
@@ -252,6 +253,17 @@ class AmpOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        # Rollout diagnostics (optional, see rsl_rl/utils/obs_diagnostics.py)
+        self.obs_diag = None
+        if self.cfg.get("obs_diagnostics", False) and self.log_dir is not None and not self.disable_logs:
+            self.obs_diag = ObsDiagnostics(
+                self.env,
+                self.log_dir,
+                obs_threshold=self.cfg["obs_diag_obs_threshold"],
+                action_threshold=self.cfg["obs_diag_action_threshold"],
+                reward_threshold=self.cfg["obs_diag_reward_threshold"],
+                max_events=self.cfg["obs_diag_max_events"],
+            )
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -322,8 +334,10 @@ class AmpOnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
+                for step in range(self.num_steps_per_env):
                     # Sample actions
+                    if self.obs_diag is not None:
+                        self.obs_diag.push_act_input(obs)
                     actions = self.alg.act(obs, privileged_obs, amp_obs)
                     # Step the environment
                     obs, rewards, dones, infos = _unpack_step(*self.env.step(actions.to(self.env.device)))
@@ -335,6 +349,21 @@ class AmpOnPolicyRunner:
                         dones.to(self.device),
                         next_amp_obs.to(self.device),
                     )
+                    # Diagnostics of the raw values (before normalization and AMP reward)
+                    if self.obs_diag is not None:
+                        self.obs_diag.record_step(
+                            it,
+                            step,
+                            {
+                                "actor": obs,
+                                "critic": infos["observations"].get("critic", obs),
+                                "amp": next_amp_obs,
+                                "actions": actions,
+                                "rewards": rewards,
+                            },
+                            dones,
+                            action_mean=self.alg.transition.action_mean,
+                        )
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
@@ -467,6 +496,15 @@ class AmpOnPolicyRunner:
             self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
+        # -- Diagnostics
+        diag_string = ""
+        if self.obs_diag is not None:
+            num_extreme_envs = self.obs_diag.log(self.writer, locs["it"])
+            diag_string += f"""{'Diag num_extreme_envs:':>{pad}} {num_extreme_envs}\n"""
+            for key, value in self.alg.diag_stats.items():
+                self.writer.add_scalar(f"Diag/{key}", value, locs["it"])
+                diag_string += f"""{f'Diag {key}:':>{pad}} {value:.4g}\n"""
+
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
 
@@ -525,6 +563,7 @@ class AmpOnPolicyRunner:
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
 
         log_string += ep_string
+        log_string += diag_string
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
