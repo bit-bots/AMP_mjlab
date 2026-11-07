@@ -821,11 +821,18 @@ def post_kick_velocity_penalty(
   env: ManagerBasedRlEnv,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
   timer_attr: str = "kick_timer",
+  delay_s: float = 0.0,
+  window_s: float = 1.0,
 ) -> torch.Tensor:
   """Penalize the anchor's own horizontal speed (squared) during the
   post-kick window (``env.kick_timer`` > 0, see ``kick_state_obs``) --
   encourages the robot to stop/settle after striking the ball instead of
   continuing to run through or past it. Zero outside the window.
+
+  The penalty starts ``delay_s`` seconds after the kick contact, so the
+  follow-through of the kick is free and the robot must be at rest from
+  ``delay_s`` on. ``window_s`` must equal the ``window_s`` of
+  ``kick_contact_cycle`` (the timer starts at that length).
   """
   robot: Entity = env.scene[anchor_cfg.name]
   vel_xy = robot.data.body_link_lin_vel_w[:, anchor_cfg.body_ids[0], :2]
@@ -833,7 +840,11 @@ def post_kick_velocity_penalty(
   timer = getattr(env, timer_attr, None)
   if timer is None:
     return torch.zeros_like(speed_sq)
-  return torch.where(timer > 0, speed_sq, torch.zeros_like(speed_sq))
+  window_steps = max(1, round(window_s / env.step_dt))
+  delay_steps = round(delay_s / env.step_dt)
+  elapsed = window_steps - timer  # steps since the kick contact
+  active = (timer > 0) & (elapsed >= delay_steps)
+  return torch.where(active, speed_sq, torch.zeros_like(speed_sq))
 
 
 # Reference speed used by kick_impact_reward's extra low-intensity boost
@@ -1145,5 +1156,3 @@ def self_collision_cost(
     return hit.sum(dim=-1).float()  # [B]
   assert data.found is not None
   return data.found.squeeze(-1)
-
-

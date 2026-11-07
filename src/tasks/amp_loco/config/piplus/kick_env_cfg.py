@@ -165,6 +165,10 @@ APPROACH_MAX_SPEED = 1.0
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
+# The actor sees the ball position as s * tanh(x / s) (bounded by s metres).
+BALL_POS_TANH_SCALE_M = 3.0
+# Seconds after the kick contact until the post-kick stop penalty starts.
+POST_KICK_REST_DELAY_S = 0.5
 # Bumped from 0.5 so the foot starts turning to line up the medial edge earlier
 # in the approach, not just in the last half-meter.
 FOOT_ALIGNMENT_CLOSE_DIST = 0.9
@@ -217,6 +221,16 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     scale=_a.scale,
     use_default_offset=_a.use_default_offset,
   )
+
+  # The "last action" observation reads the CLIPPED action of the term.
+  # mjlab's version reads ActionManager.action, which holds the unclipped
+  # policy output (a feedback loop of 1e2-1e3 values). The action-rate penalty
+  # stays on the raw output, so that the policy is punished for raw actions
+  # beyond the limits.
+  for _group in ("actor", "critic"):
+    cfg.observations[_group].terms["actions"] = ObservationTermCfg(
+      func=amp_mdp.last_action_clipped, params={"action_name": "joint_pos"}
+    )
 
   # --- Terrain: flat plane with the booster_mjlab contact model -----------
   # Like the booster_mjlab Flat-Amp task: a plane (piplus_amp_flat_env_cfg)
@@ -425,6 +439,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "range_noise_std": 0.01,
       "bearing_noise_std_deg": 2.0,
       "max_lag": BALL_OBS_MAX_LAG_STEPS,
+      "tanh_scale": BALL_POS_TANH_SCALE_M,
     },
   )
   # Actor-only noisy kick-direction observation: Gaussian noise on the
@@ -488,7 +503,12 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.rewards["post_kick_stop"] = RewardTermCfg(
     func=amp_mdp.post_kick_velocity_penalty,
     weight=-3.0,  # was -0.3: the robot kept walking after the strike
-    params={"anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,))},
+    params={
+      "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
+      # The robot must be at rest 0.5 s after the kick: no penalty before.
+      "delay_s": POST_KICK_REST_DELAY_S,
+      "window_s": KICK_WINDOW_S,
+    },
   )
   # Small dense reward for facing the ball (mirrors mjxperiment's
   # _reward_orient_to_ball) -- helps line up a proper kick approach rather

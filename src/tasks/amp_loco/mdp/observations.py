@@ -206,10 +206,16 @@ def object_pos_b_noisy_delayed_world(
     object_cfg: SceneEntityCfg,
     anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
     max_lag: int = 5,
+    tanh_scale: float | None = None,
     **noise_kwargs,
 ) -> torch.Tensor:
     """Actor-only ball position: noisy (``object_pos_b_noisy``), delayed in the
     WORLD frame, and then expressed in the CURRENT anchor frame.
+
+    With ``tanh_scale`` set, each axis of the result is ``s * tanh(x / s)``:
+    nearly the identity for a close ball and bounded by ``s`` for a far ball.
+    The function is odd, so the left-right mirror of the observation is
+    unchanged.
 
     Each step the noisy measurement is moved to the world frame with the anchor
     pose of that step and stored. The observation is the stored world position
@@ -240,7 +246,10 @@ def object_pos_b_noisy_delayed_world(
     lag = torch.randint(0, max_lag + 1, (pos_w.shape[0],), device=pos_w.device)
     delayed_w = hist[torch.arange(pos_w.shape[0], device=pos_w.device), lag]
     env.ball_obs_delayed_w = delayed_w
-    return quat_apply_inverse(anchor_quat_w, delayed_w - anchor_pos_w)
+    pos_b = quat_apply_inverse(anchor_quat_w, delayed_w - anchor_pos_w)
+    if tanh_scale is not None:
+        pos_b = tanh_scale * torch.tanh(pos_b / tanh_scale)
+    return pos_b
 
 
 def object_lin_vel_b(
@@ -375,3 +384,9 @@ def robot_body_ang_vel_b(
     ).reshape(env.num_envs, num_bodies, 3)
 
     return body_ang_vel_b.reshape(env.num_envs, -1)
+
+def last_action_clipped(env: ManagerBasedRlEnv, action_name: str = "joint_pos") -> torch.Tensor:
+    """Last action as the action term applied it, after the clip to the joint
+    limits (``LimitedJointPositionAction``). Unlike mjlab's ``last_action``,
+    which returns the unclipped policy output, this value is bounded."""
+    return env.action_manager.get_term(action_name).raw_action

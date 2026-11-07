@@ -19,10 +19,13 @@ class LimitedJointPositionAction(JointPositionAction):
   position target (offset + scale * action) stays inside the joint's soft
   position limits.
 
-  The clipped value is the one stored as the raw action. So the "last action"
-  observation and the action-rate reward see a bounded action too. Without
-  the clip, one policy output of 1e3 or more (seen in the kick task) went into
-  the observation history, grew by feedback, and collapsed training.
+  The clipped value is the one stored as the term's ``raw_action``. Note that
+  ``ActionManager.action`` (used by mjlab's ``last_action`` and
+  ``action_rate_l2``) still holds the UNCLIPPED policy output. For a bounded
+  feedback, use ``last_action_clipped`` (mdp/observations.py), which reads
+  this term. Without it, one
+  policy output of 1e3 or more (seen in the kick task) went into the
+  observation history, grew by feedback, and collapsed training.
   """
 
   def process_actions(self, actions: torch.Tensor):
