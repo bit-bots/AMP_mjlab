@@ -169,6 +169,8 @@ KICK_WINDOW_S = 1.0
 BALL_POS_TANH_SCALE_M = 3.0
 # Seconds after the kick contact until the post-kick stop penalty starts.
 POST_KICK_REST_DELAY_S = 0.5
+# A swing shorter than this is penalized at touchdown (after the curriculum).
+MIN_SWING_PENALTY_S = 0.3
 # Bumped from 0.5 so the foot starts turning to line up the medial edge earlier
 # in the approach, not just in the last half-meter.
 FOOT_ALIGNMENT_CLOSE_DIST = 0.9
@@ -432,7 +434,9 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
       "std": 0.0175,
-      "std_post_kick": 0.25,
+      "std_post_kick": 0.25,  # not used while post_kick_std_max is set
+      # After the kick, each episode draws its noise std uniformly from 0..0.3 m.
+      "post_kick_std_max": 0.3,
       # Range/bearing noise stacked on top of the isotropic std above (see
       # object_pos_b_noisy docstring) -- NOT env.kick_dir_world, just the
       # ball's own local-frame position treated as polar coordinates.
@@ -536,16 +540,16 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "asset_cfg": SceneEntityCfg("robot", site_names=SITE_NAMES),
     },
   )
-  # Back to mjlab's standard velocity-task gait reward (was briefly a
-  # short-air-time-only penalty): +1 per foot whose current swing (air time)
-  # falls in a MEDIUM range (0.05s-0.5s, mjlab's own defaults), no
-  # command_name (the kick task has none, matching foot_slip above). Bumped
-  # from 1.0, then again from 2.5.
-  # Air-time reward is switched off in the post-kick window (kick_timer > 0).
-  cfg.rewards["foot_air_time"] = RewardTermCfg(
-    func=amp_mdp.feet_air_time_pre_kick,
-    weight=3.5,
-    params={"sensor_name": "feet_ground_contact"},
+  # No air-time reward (foot_air_time removed): the short-swing penalty below
+  # is the only gait shaping term for the step length.
+  # Penalty for a swing shorter than MIN_SWING_PENALTY_S (micro steps,
+  # stutter). The value is given once per swing at touchdown, so the weight is
+  # large (the reward manager multiplies by the step time). A curriculum below
+  # switches it on after the kick is learned.
+  cfg.rewards["short_swing"] = RewardTermCfg(
+    func=amp_mdp.short_swing_penalty,
+    weight=-80.0,
+    params={"sensor_name": "feet_ground_contact", "min_air_time": MIN_SWING_PENALTY_S},
   )
   # Tiny torque penalty (not present anywhere in the kick task's reward set
   # before this): mdp.joint_torques_l2 is mjlab's built-in L2 actuator-force
@@ -784,6 +788,15 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "stages": [(3000 * 24, 4.0), (10000 * 24, 8.0)],
     },
   )
+  # Short-swing penalty: off until iteration 3000, half weight until 6000,
+  # then the full weight (-80 per unit of squared shortfall at touchdown).
+  cfg.curriculum["stage_short_swing"] = CurriculumTermCfg(
+    func=amp_mdp.stage_reward_weight_scale,
+    params={
+      "reward_names": ["short_swing"],
+      "stages": [(0, 0.0), (3000 * 24, 0.5), (6000 * 24, 1.0)],
+    },
+  )
   # Completely drop ball_kick_contact's one-shot reward at iteration 2000 --
   # it exists purely to bootstrap discovering ball contact at all; once
   # that's established this early, kick_impact/kick_direction (which score
@@ -840,6 +853,10 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if os.environ.get("PLAY_NO_BALL_NOISE") == "1":
       _p = cfg.observations["actor"].terms["ball_pos_b"].params
       _p.update(std=0.0, std_post_kick=0.0, range_noise_std=0.0, bearing_noise_std_deg=0.0)
+    # PLAY_NO_PUSH=1 removes the random impulses on the robot (the pink force
+    # arrows in the viewer).
+    if os.environ.get("PLAY_NO_PUSH") == "1":
+      cfg.events.pop("impulse", None)
     cfg.scene.entities["ball_ghost"] = get_ball_ghost_cfg()
     cfg.events["ball_obs_ghost"] = EventTermCfg(
       func=amp_mdp.update_ball_obs_ghost,

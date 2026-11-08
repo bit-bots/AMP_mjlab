@@ -151,6 +151,7 @@ def object_pos_b_noisy(
     timer_attr: str = "kick_timer",
     range_noise_std: float = 0.2,
     bearing_noise_std_deg: float = 5.0,
+    post_kick_std_max: float | None = None,
 ) -> torch.Tensor:
     """Actor-only noisy variant of ``object_pos_b``: much noisier during the
     post-kick phase (``timer_attr`` on ``env`` > 0, see ``kick_state_obs``)
@@ -170,6 +171,11 @@ def object_pos_b_noisy(
     distance-independent). This model is applied to the true position BEFORE
     the isotropic noise below, so the two stack as independent error sources
     rather than one replacing the other.
+
+    With ``post_kick_std_max`` set, ``std_post_kick`` is not used. Instead, each
+    episode draws its post-kick std uniformly from 0..``post_kick_std_max`` at
+    the first step (kept in ``env.post_kick_std``), so some episodes have a
+    clean ball observation after the kick and some have a very noisy one.
 
     Noise is applied here (per-env-conditional std), not via the generic
     ``ObservationTermCfg.noise`` pipeline (a single fixed ``GaussianNoiseCfg``
@@ -193,11 +199,17 @@ def object_pos_b_noisy(
         post_kick = torch.zeros(pos_b.shape[0], dtype=torch.bool, device=pos_b.device)
     else:
         post_kick = timer > 0
-    sigma = torch.where(
-        post_kick,
-        torch.full_like(pos_b[:, 0], std_post_kick),
-        torch.full_like(pos_b[:, 0], std),
-    )
+    std_after = torch.full_like(pos_b[:, 0], std_post_kick)
+    if post_kick_std_max is not None:
+        episode_std = getattr(env, "post_kick_std", None)
+        if episode_std is None:
+            episode_std = torch.zeros_like(std_after)
+            env.post_kick_std = episode_std
+        fresh = env.episode_length_buf == 0
+        if fresh.any():
+            episode_std[fresh] = torch.rand(int(fresh.sum()), device=pos_b.device) * post_kick_std_max
+        std_after = episode_std
+    sigma = torch.where(post_kick, std_after, torch.full_like(pos_b[:, 0], std))
     return pos_b + torch.randn_like(pos_b) * sigma.unsqueeze(-1)
 
 

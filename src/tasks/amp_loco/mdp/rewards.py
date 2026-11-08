@@ -817,6 +817,33 @@ def feet_air_time_pre_kick(
   return reward * (timer == 0).float()
 
 
+def short_swing_penalty(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  min_air_time: float = 0.3,
+) -> torch.Tensor:
+  """Penalty for a swing that ends shorter than ``min_air_time`` seconds.
+
+  The penalty is given once per swing, at the first step with ground contact.
+  Per foot, it is the squared shortfall ``((min_air_time - air_time) /
+  min_air_time) ** 2``, so it is 1 for a swing of almost 0 s and 0 for a
+  swing of ``min_air_time`` or more. The first contact after a reset has no
+  swing before it (``last_air_time`` is 0) and gives no penalty. The penalty also holds in the post-kick window
+  (unlike ``feet_air_time_pre_kick``).
+
+  The reward manager multiplies the value by the step time, so the weight must
+  be large (the value is only non-zero for one step per swing).
+  """
+  from mjlab.sensor import ContactSensor
+
+  sensor: ContactSensor = env.scene[sensor_name]
+  data = sensor.data
+  assert data.last_air_time is not None
+  landed = sensor.compute_first_contact(env.step_dt) & (data.last_air_time > 0.0)
+  shortfall = torch.clamp(min_air_time - data.last_air_time, min=0.0) / min_air_time
+  return torch.sum(torch.square(shortfall) * landed.float(), dim=1)
+
+
 def post_kick_velocity_penalty(
   env: ManagerBasedRlEnv,
   anchor_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
