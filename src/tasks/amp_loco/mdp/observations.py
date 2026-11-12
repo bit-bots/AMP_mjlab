@@ -34,11 +34,14 @@ def _apply_imu_bias(env: "ManagerBasedRlEnv", vec: torch.Tensor) -> torch.Tensor
 def imu_gyro_biased(env: "ManagerBasedRlEnv", sensor_name: str) -> torch.Tensor:
   """Gyro (base angular velocity) sensor reading with the IMU mounting bias applied.
 
+  The per-environment gyro offset of ``randomize_gyro_bias`` is added too.
   Actor-only variant of ``builtin_sensor``; the clean critic keeps the unbiased
   reading. Additive gyro noise is applied on top by the observation manager.
   """
   sensor = env.scene[sensor_name]
-  return _apply_imu_bias(env, sensor.data)
+  gyro = _apply_imu_bias(env, sensor.data)
+  bias = getattr(env, "gyro_bias", None)
+  return gyro if bias is None else gyro + bias
 
 
 def imu_projected_gravity_biased(
@@ -363,7 +366,7 @@ def kick_intensity_obs(
     """Commanded kick intensity for the current ball "life" (``env.kick_intensity``,
     set by ``kick_contact_cycle``/``_place_ball_near_robot``, mdp/events.py):
     a continuous value in [0, 1], nonlinearly mapped to a target ball speed
-    by ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- 0.0 -> 0.3 m/s,
+    by ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- 0.0 -> 1 m/s,
     0.5 -> 4 m/s, 1.0 -> unbounded ("as hard as possible").
 
     This is a task command, not a sensed quantity -- the actor must see the
@@ -402,3 +405,4 @@ def last_action_clipped(env: ManagerBasedRlEnv, action_name: str = "joint_pos") 
     limits (``LimitedJointPositionAction``). Unlike mjlab's ``last_action``,
     which returns the unclipped policy output, this value is bounded."""
     return env.action_manager.get_term(action_name).raw_action
+

@@ -58,7 +58,7 @@ from src.tasks.amp_loco.mdp.terrain import (
 BALL_NAME = "ball"
 
 # The ball respawns after a kick only if it moved at least this far (m). Small,
-# so that a touch of a few cm (the slowest kick intensity) ends the life too.
+# so that a weak kick (the slowest kick intensity, 1 m/s) ends the life too.
 KICK_MIN_BALL_TRAVEL = 0.03
 
 # Random ball nudges: interval per env (s) and how far the ball rolls (m).
@@ -70,9 +70,6 @@ BALL_OBS_MAX_LAG_STEPS = 5
 # No pushes before iteration 2000; the push chance then rises linearly to 1
 # at iteration 15000.
 BALL_PUSH_RAMP_ITERATIONS = (2_000, 15_000)
-# Horizontal distance (m) from base_link under which the ball counts as under
-# the robot.
-BALL_UNDER_BASE_RADIUS = 0.05
 BALL_ENTITY_BODY_NAME = "ball"  # body name inside the ball's own MJCF (see ball.py)
 RIGHT_FOOT_SUBTREE = "r_ankle_roll_link"
 LEFT_FOOT_SUBTREE = "l_ankle_roll_link"
@@ -156,7 +153,7 @@ APPROACH_MAX_SPEED = 1.0
 # Kick intensity (env.kick_intensity, see kick_contact_cycle) is a continuous
 # command in [0, 1], resampled uniformly for every ball "life" and mapped to a
 # target ball speed by kick_intensity_to_target_speed (mdp/rewards.py): 0.0 ->
-# 0.3 m/s (a touch, the ball rolls a few cm), 0.5 -> 4 m/s, 1.0 -> "as hard as
+# 1 m/s (the weakest kick), 0.5 -> 4 m/s, 1.0 -> "as hard as
 # possible". kick_impact_reward gives the same maximum for the target speed at
 # every intensity, and negative values for a ball that is too slow or too fast.
 # Post-contact reward-farming window before the ball resets in place (episode
@@ -730,7 +727,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "medial_signs": (1.0, -1.0),  # +Y medial for right, -Y medial for left (see rewards.py docstring).
       "window_s": KICK_WINDOW_S,
       "min_ball_travel": KICK_MIN_BALL_TRAVEL,
-      # A touch of 0.3 m/s (intensity 0) must open the kick window.
+      # The weakest kick (1 m/s, intensity 0) must open the kick window.
       "impact_speed_threshold": 0.15,
       "dist_range": BALL_DIST_RANGE,
       "angle_range_deg": BALL_ANGLE_RANGE_DEG,
@@ -908,6 +905,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       if _ev.mode == "startup" and (
         "mdp.dr" in getattr(_ev.func, "__module__", "")
         or _ev.func is randomize_terrain_contact
+        or _ev.func is amp_mdp.randomize_leg_actuators
+        or _ev.func is amp_mdp.randomize_gyro_bias
       ):
         _ev.mode = "reset"
 

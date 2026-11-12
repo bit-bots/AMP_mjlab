@@ -5,6 +5,7 @@ import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
+from mjlab.envs.mdp import dr
 from mjlab.envs.mdp import events as event_fns
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
@@ -172,7 +173,9 @@ def piplus_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # and magnitude. mjxperiment uses gyro ~ N(0, 0.05 rad/s) and projected-gravity
   # ~ N(0, 0.03). AMP defaults are uniform +/-0.2 (gyro) and +/-0.05 (gravity),
   # both noisier and the wrong shape.
-  cfg.observations["actor"].terms["base_ang_vel"].noise = GaussianNoiseCfg(mean=0.0, std=0.05)
+  # The per-environment gyro offset (randomize_gyro_bias, +/-0.01 rad/s) covers part of the
+  # gyro error, so the noise is lower: std 0.04 instead of 0.05.
+  cfg.observations["actor"].terms["base_ang_vel"].noise = GaussianNoiseCfg(mean=0.0, std=0.04)
   cfg.observations["actor"].terms["projected_gravity"].noise = GaussianNoiseCfg(mean=0.0, std=0.03)
   # joint_pos: mjxperiment uses uniform +/-0.05 rad (same distribution as AMP's, but
   # AMP defaulted to a quieter +/-0.01). Bump to match.
@@ -195,6 +198,39 @@ def piplus_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     func=amp_mdp.randomize_imu_mounting_bias,
     mode="reset",
     params={"std_rad": 0.01},
+  )
+
+  # Actuator model of the real robot (system identification). The nominal
+  # model is in piplus_constants.py. Once per environment (startup event; the
+  # many parallel environments cover the spread, and a draw at every reset costs
+  # time): PD gains, torque limit, speed limit and command delay of the legs
+  # (randomize_leg_actuators; the delay is the whole round trip of the actuator,
+  # with no extra delay of the observation), armature and Coulomb friction per
+  # leg joint, and a gyro offset.
+  # One SceneEntityCfg per event: resolving rewrites the joint names.
+  def _legs() -> SceneEntityCfg:
+    return SceneEntityCfg(
+      "robot", joint_names=(".*_(hip_pitch|hip_roll|thigh|calf|ankle_pitch|ankle_roll)_joint",)
+    )
+
+  cfg.events["leg_actuators"] = EventTermCfg(
+    func=amp_mdp.randomize_leg_actuators, mode="startup", params={}
+  )
+  cfg.events["leg_lags"] = EventTermCfg(
+    func=amp_mdp.apply_leg_lags, mode="reset", params={}
+  )
+  cfg.events["leg_armature"] = EventTermCfg(
+    func=dr.joint_armature,
+    mode="startup",
+    params={"asset_cfg": _legs(), "operation": "abs", "ranges": (0.013, 0.035)},
+  )
+  cfg.events["leg_frictionloss"] = EventTermCfg(
+    func=dr.joint_friction,
+    mode="startup",
+    params={"asset_cfg": _legs(), "operation": "abs", "ranges": (0.1, 0.6)},
+  )
+  cfg.events["gyro_bias"] = EventTermCfg(
+    func=amp_mdp.randomize_gyro_bias, mode="startup", params={"max_bias": 0.01}
   )
 
   if play:

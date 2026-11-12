@@ -2,13 +2,12 @@
 
 The robot model is kept byte-identical to the smp/BeyondMimic Pi Plus port
 (``piplus.xml`` + meshes copied verbatim). For real-robot deployment the actuators
-mirror the bitbots ``mjlab_piplus`` model: ``XmlPositionActuatorCfg`` reads the XML's
-``<position>`` gains (kp=30/50, kv=0.6/1.1, forcerange), wrapped in
-``DelayedActuatorCfg`` for a randomized 0-5 physics-step (0-25 ms @ 50 Hz
-control) actuator latency. (mjlab 1.2.0 splits into Xml + Delayed cfgs what
-mjlab_piplus's 1.3.0 ``XmlActuatorCfg`` combines.)
+use two groups. The arms are position servos (kp 6, kd 0.6) with a randomized
+0-5 physics-step latency. The legs use the identified actuator model of the real
+robot (see "Leg actuator model" below).
 """
 
+import re
 from pathlib import Path
 
 import mujoco
@@ -19,6 +18,7 @@ from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.os import update_assets
 from mjlab.utils.spec_config import CollisionCfg
 from src import SRC_PATH
+from src.assets.robots.piplus.leg_motor import LegMotorActuatorCfg
 
 # Actuator delay range in PHYSICS timesteps (mjlab DelayBuffer quantizes to physics
 # steps, not control steps). At 5 ms physics (decimation 4 -> 50 Hz control):
@@ -60,6 +60,11 @@ def get_spec() -> mujoco.MjSpec:
     for joint in spec.joints:
       if joint.type != mujoco.mjtJoint.mjJNT_FREE:
         joint.damping = np.zeros(3)
+  # Leg joint force cap above the torque limit of the model (see LEG_FORCE_CAP).
+  for joint in spec.joints:
+    if re.fullmatch("|".join(LEG_JOINT_NAMES), joint.name):
+      joint.actfrcrange = [-LEG_FORCE_CAP, LEG_FORCE_CAP]
+      joint.actfrclimited = mujoco.mjtLimited.mjLIMITED_TRUE
   return spec
 
 
@@ -91,37 +96,67 @@ PIPLUS_ACTUATOR_ARM = DelayedActuatorCfg(
   delay_max_lag=ACTUATOR_LAG_MAX,
 )
 
-# Hip-roll gets stiffer derivative gain (kv=1.4) for lateral stability.
-PIPLUS_ACTUATOR_HIP_ROLL = DelayedActuatorCfg(
-  base_cfg=BuiltinPositionActuatorCfg(
-    target_names_expr=(".*_hip_roll_joint",),
-    stiffness=50.0,
-    damping=1.4,
-    effort_limit=20.0,
-    armature=0.01316,
-    frictionloss=0.2,
-  ),
-  delay_min_lag=ACTUATOR_LAG_MIN,
-  delay_max_lag=ACTUATOR_LAG_MAX,
+##
+# Leg actuator model (system identification of the real robot, handoff
+# SIM_RL_HANDOFF.md). All 12 leg joints share one model:
+#
+# * PD gains kp 50, kd 2.0 (hip roll too).
+# * Armature 0.02, Coulomb friction loss 0.3 Nm, no passive viscous damping
+#   (REMOVE_PASSIVE_DAMPING above).
+# * Torque-speed limit on the driving side only (stall torque 32 Nm, no-load
+#   speed 8 rad/s, limit 20 Nm). The limit is 20 Nm up to 3 rad/s and 0 Nm from
+#   8 rad/s on (no braking by the motor itself). A braking torque (torque against
+#   the joint velocity) is limited to 20 Nm at every speed (leg_motor.py).
+# * The PD law runs explicitly in every physics step (LegMotorActuator) because
+#   the torque limit depends on the joint velocity of that step.
+# * Command delay of 2 to 4 physics steps (10 to 20 ms): the whole round trip of
+#   the real actuator, one value per environment for all leg joints
+#   (``randomize_leg_actuators``, mdp/actuator_model.py).
+#
+# These are the nominal values. ``randomize_leg_actuators`` and the
+# armature/friction events of env_cfgs.py randomize them per environment.
+##
+
+LEG_KP = 50.0
+LEG_KD = 2.0
+LEG_ARMATURE = 0.02
+LEG_FRICTIONLOSS = 0.3
+LEG_STALL_TORQUE = 32.0  # Nm; with LEG_EFFORT_LIMIT it gives the knee at 3 rad/s
+LEG_EFFORT_LIMIT = 20.0  # Nm; TAU_PEAK and TAU_BRAKE of the handoff
+LEG_NO_LOAD_SPEED = 8.0  # rad/s; W0 of the handoff
+# MuJoCo cap of the leg motors and of the leg joints (actuatorfrcrange). It is
+# above LEG_EFFORT_LIMIT so that the torque randomization (up to x1.1 x1.03)
+# is not cut by it. The torque limit of the model is LEG_EFFORT_LIMIT.
+LEG_FORCE_CAP = 25.0
+# Round trip of the real actuator (command to torque in the joint state): 10 to
+# 20 ms. The model has this as the command delay only, with no extra delay of
+# the joint state in the observation.
+LEG_DELAY_LAG_MIN = 2  # physics steps (10 ms)
+LEG_DELAY_LAG_MAX = 4  # physics steps (20 ms)
+LEG_JOINT_NAMES = (
+  ".*_hip_pitch_joint",
+  ".*_hip_roll_joint",
+  ".*_thigh_joint",
+  ".*_calf_joint",
+  ".*_ankle_pitch_joint",
+  ".*_ankle_roll_joint",
 )
 
 PIPLUS_ACTUATOR_LEG = DelayedActuatorCfg(
-  base_cfg=BuiltinPositionActuatorCfg(
-    target_names_expr=(
-      ".*_hip_pitch_joint",
-      ".*_thigh_joint",
-      ".*_calf_joint",
-      ".*_ankle_pitch_joint",
-      ".*_ankle_roll_joint",
-    ),
-    stiffness=50.0,
-    damping=1.1,
-    effort_limit=20.0,
-    armature=0.01316,
-    frictionloss=0.2,
+  base_cfg=LegMotorActuatorCfg(
+    target_names_expr=LEG_JOINT_NAMES,
+    stiffness=LEG_KP,
+    damping=LEG_KD,
+    effort_limit=LEG_FORCE_CAP,
+    saturation_effort=LEG_STALL_TORQUE,
+    velocity_limit=LEG_NO_LOAD_SPEED,
+    armature=LEG_ARMATURE,
+    frictionloss=LEG_FRICTIONLOSS,
   ),
-  delay_min_lag=ACTUATOR_LAG_MIN,
-  delay_max_lag=ACTUATOR_LAG_MAX,
+  delay_min_lag=LEG_DELAY_LAG_MIN,
+  delay_max_lag=LEG_DELAY_LAG_MAX,
+  # The lag is set once per environment by randomize_leg_actuators and again after every reset by apply_leg_lags. Hold it.
+  delay_hold_prob=1.0,
 )
 
 ##
@@ -183,7 +218,7 @@ FULL_COLLISION = CollisionCfg(
 )
 
 PIPLUS_ARTICULATION = EntityArticulationInfoCfg(
-  actuators=(PIPLUS_ACTUATOR_ARM, PIPLUS_ACTUATOR_HIP_ROLL, PIPLUS_ACTUATOR_LEG),
+  actuators=(PIPLUS_ACTUATOR_ARM, PIPLUS_ACTUATOR_LEG),
   soft_joint_pos_limit_factor=0.9,
 )
 

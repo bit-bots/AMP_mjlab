@@ -545,7 +545,7 @@ class kick_contact_cycle:
     [0, 1], resampled uniformly by ``_place_ball_near_robot`` every time the
     ball is repositioned, and mapped to a target ball speed by
     ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- continuously from
-    a 0.3 m/s touch at 0.0 through a 4 m/s kick at 0.5 to an unbounded,
+    a 1 m/s kick at 0.0 through a 4 m/s kick at 0.5 to an unbounded,
     as-hard-as-possible kick at 1.0. ``kick_impact_reward`` (mdp/rewards.py)
     scores the ball speed against this target (too slow and too fast are both
     negative). The policy sees the current value via ``kick_intensity_obs``
@@ -776,3 +776,23 @@ def update_ball_obs_ghost(
     env.scene[ghost_cfg.name].write_mocap_pose_to_sim(
         pose, env_ids=torch.arange(pos_w.shape[0], device=pos_w.device)
     )
+
+
+def randomize_gyro_bias(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    max_bias: float = 0.01,
+) -> None:
+    """Per-environment gyro offset in rad/s, uniform in +/- ``max_bias`` per axis.
+
+    The measured gyro bias of the real robots is up to 0.01 rad/s and differs per
+    robot. The actor gyro (``imu_gyro_biased``) adds it. The critic sees the true
+    value.
+    """
+    if not hasattr(env, "gyro_bias"):
+        env.gyro_bias = torch.zeros(env.num_envs, 3, device=env.device)
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    env.gyro_bias[env_ids] = (
+        2.0 * torch.rand(env_ids.shape[0], 3, device=env.device) - 1.0
+    ) * max_bias

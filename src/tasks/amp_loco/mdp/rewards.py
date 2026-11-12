@@ -597,22 +597,6 @@ def foot_base_proximity_penalty(
   return torch.clamp(min_dist - dist, min=0.0)
 
 
-def ball_under_base_penalty(
-  env: ManagerBasedRlEnv,
-  ball_cfg: SceneEntityCfg,
-  base_cfg: SceneEntityCfg,
-  radius: float = 0.05,
-) -> torch.Tensor:
-  """1 while the ball center is within ``radius`` (horizontal distance) of the
-  base_link projected onto the ground, else 0 -- the ball is then under the
-  robot, between the legs, where a kick is not possible."""
-  ball: Entity = env.scene[ball_cfg.name]
-  robot: Entity = env.scene[base_cfg.name]
-  ball_xy = ball.data.root_link_pos_w[:, :2]
-  base_xy = robot.data.body_link_pos_w[:, base_cfg.body_ids[0], :2]
-  return (torch.norm(ball_xy - base_xy, dim=-1) < radius).float()
-
-
 def object_contact_reward(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -794,29 +778,6 @@ def standing_still_penalty(
   return (standing_still & not_touched_yet & not_post_kick).float()
 
 
-def feet_air_time_pre_kick(
-  env: ManagerBasedRlEnv,
-  sensor_name: str,
-  threshold_min: float = 0.05,
-  threshold_max: float = 0.5,
-  timer_attr: str = "kick_timer",
-) -> torch.Tensor:
-  """mjlab's ``feet_air_time`` (+1 per foot whose current swing lasts
-  threshold_min..threshold_max s), but zero during the post-kick window
-  (``env.kick_timer`` > 0): the robot should settle after the strike, not keep
-  stepping for air-time reward.
-  """
-  from mjlab.tasks.velocity.mdp.rewards import feet_air_time
-
-  reward = feet_air_time(
-    env, sensor_name=sensor_name, threshold_min=threshold_min, threshold_max=threshold_max
-  )
-  timer = getattr(env, timer_attr, None)
-  if timer is None:
-    return reward
-  return reward * (timer == 0).float()
-
-
 def short_swing_penalty(
   env: ManagerBasedRlEnv,
   sensor_name: str,
@@ -828,8 +789,7 @@ def short_swing_penalty(
   Per foot, it is the squared shortfall ``((min_air_time - air_time) /
   min_air_time) ** 2``, so it is 1 for a swing of almost 0 s and 0 for a
   swing of ``min_air_time`` or more. The first contact after a reset has no
-  swing before it (``last_air_time`` is 0) and gives no penalty. The penalty also holds in the post-kick window
-  (unlike ``feet_air_time_pre_kick``).
+  swing before it (``last_air_time`` is 0) and gives no penalty. The penalty also holds in the post-kick window.
 
   The reward manager multiplies the value by the step time, so the weight must
   be large (the value is only non-zero for one step per swing).
@@ -874,9 +834,8 @@ def post_kick_velocity_penalty(
   return torch.where(active, speed_sq, torch.zeros_like(speed_sq))
 
 
-# Target speed at kick intensity 0 (m/s). The ball then rolls only a few cm
-# (1 to 8 cm, depending on the rolling friction draw of the env).
-KICK_MIN_TARGET_SPEED = 0.3
+# Target speed at kick intensity 0 (m/s): the weakest kick.
+KICK_MIN_TARGET_SPEED = 1.0
 # Target speed at kick intensity 0.5 (m/s).
 KICK_REFERENCE_SPEED = 4.0
 # From this target speed on, a kick counts as "as hard as possible": a ball that
@@ -889,8 +848,7 @@ def kick_intensity_to_target_speed(intensity: torch.Tensor) -> torch.Tensor:
   see ``kick_contact_cycle``/``_place_ball_near_robot``, mdp/events.py) to a
   target ball speed in m/s.
 
-  - 0 to 0.5: geometric (log-uniform) from ``KICK_MIN_TARGET_SPEED`` (0.3 m/s,
-    a touch that rolls the ball a few cm) to ``KICK_REFERENCE_SPEED`` (4 m/s).
+  - 0 to 0.5: geometric (log-uniform) from ``KICK_MIN_TARGET_SPEED`` (1 m/s) to ``KICK_REFERENCE_SPEED`` (4 m/s).
   - 0.5 to 1: ``2 / (1 - intensity)``, from 4 m/s to +inf ("as hard as
     possible"). This is the old curve, so it joins without a step at 0.5.
 
@@ -959,7 +917,7 @@ def _kick_speed_factor(
   target speed, 0 at the tolerance boundary, -1 far away. The error is the log
   of the speed ratio, so "too fast by a factor 2" and "too slow by a factor 2"
   count the same, and the tolerance is relative (the same relative width for a
-  touch of 0.3 m/s and a kick of 4 m/s). ``sigma`` is in log units; the factor
+  weak kick of 1 m/s and a kick of 4 m/s). ``sigma`` is in log units; the factor
   is 0 at 1.18 * sigma (sigma 0.25: a speed 34 % off the target).
 
   From ``KICK_MAX_TARGET_SPEED`` on, the target means "this fast or faster":
@@ -1010,7 +968,7 @@ def kick_impact_reward(
   finds kicks at all. At 1, the signed quality is used unchanged.
 
   The reward is scaled by the target speed: ``near_scale`` for the weakest
-  kick (0.3 m/s) and ``far_scale`` for the hardest (``KICK_MAX_TARGET_SPEED``),
+  kick (1 m/s) and ``far_scale`` for the hardest (``KICK_MAX_TARGET_SPEED``),
   log-linear in between. Near kicks pay more, far kicks less. The mean over the
   intensities is about 1.
 
