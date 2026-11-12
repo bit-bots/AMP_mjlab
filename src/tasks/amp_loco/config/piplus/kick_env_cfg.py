@@ -57,8 +57,9 @@ from src.tasks.amp_loco.mdp.terrain import (
 
 BALL_NAME = "ball"
 
-# The ball respawns after a kick only if it moved at least this far (m).
-KICK_MIN_BALL_TRAVEL = 0.3
+# The ball respawns after a kick only if it moved at least this far (m). Small,
+# so that a touch of a few cm (the slowest kick intensity) ends the life too.
+KICK_MIN_BALL_TRAVEL = 0.03
 
 # Random ball nudges: interval per env (s) and how far the ball rolls (m).
 BALL_PUSH_INTERVAL_S = (0.5, 3.0)
@@ -152,16 +153,12 @@ APPROACH_LANE_HALF_WIDTH = 0.40
 APPROACH_LANE_STRENGTH = 1.0
 APPROACH_LANE_BEHIND_GAIN = 0.35
 APPROACH_MAX_SPEED = 1.0
-# Kick intensity (env.kick_intensity, see kick_contact_cycle) is now a
-# continuous command in [0, 1], resampled uniformly for every ball "life" and
-# mapped to a target ball speed by kick_intensity_to_target_speed
-# (mdp/rewards.py): 0.0 -> 1 m/s, 0.5 -> 4 m/s, 1.0 -> unbounded ("as hard as
-# possible", no speed cap at all). Every life is penalized for exceeding its
-# own target speed (kick_speed_cap_penalty), and kick_impact_reward boosts a
-# low-intensity kick's reward to compensate for its inherently lower speed --
-# both computed from intensity directly now, no separate constants to tune
-# (previously STRONG_KICK_PROB/WEAK_KICK_MAX_SPEED/WEAK_KICK_IMPACT_BOOST
-# implemented a hand-tuned binary version of this).
+# Kick intensity (env.kick_intensity, see kick_contact_cycle) is a continuous
+# command in [0, 1], resampled uniformly for every ball "life" and mapped to a
+# target ball speed by kick_intensity_to_target_speed (mdp/rewards.py): 0.0 ->
+# 0.3 m/s (a touch, the ball rolls a few cm), 0.5 -> 4 m/s, 1.0 -> "as hard as
+# possible". kick_impact_reward gives the same maximum for the target speed at
+# every intensity, and negative values for a ball that is too slow or too fast.
 # Post-contact reward-farming window before the ball resets in place (episode
 # keeps running). Halved from 2.0s.
 KICK_WINDOW_S = 1.0
@@ -206,8 +203,13 @@ KICK_FOOT_SELECT_ANGLE_THRESHOLD_DEG = 20.0
 # reliably hit it, making kicking net-negative in expectation and collapsing
 # the incentive to commit to a full kick. Now a longer runway (2000-14000)
 # and a less extreme final tolerance (15deg).
-KICK_DIR_SIGMA_START = math.radians(45.0)
+KICK_DIR_SIGMA_START = math.radians(60.0)
 KICK_DIR_SIGMA_END = math.radians(15.0)
+# Tolerance of the kick speed in log units of the speed ratio (kick_impact,
+# _kick_speed_factor). The reward is 0 at 1.18 * sigma: 1.2 is a ball 4.1 times
+# too fast or too slow, 0.4 is a ball 60 % off the target speed (x1.6 or /1.6).
+KICK_SPEED_SIGMA_START = 1.2
+KICK_SPEED_SIGMA_END = 0.4
 
 
 def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -591,15 +593,17 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # actually connect well rather than settle for a token tap. Also gated by
   # dir_sigma (see _kick_dir_factor, rewards.py): a wrong-direction kick isn't
   # just under-rewarded, it goes negative once outside the tolerance cone.
+  # Weight 45: the old kick_impact paid 45 per second of window on average
+  # (over the intensities) for a perfect kick (20 at high intensity, up to 120
+  # at the lowest). Now a perfect kick pays the same at every intensity.
   cfg.rewards["kick_impact"] = RewardTermCfg(
     func=amp_mdp.kick_impact_reward,
-    weight=20.0,
+    weight=45.0,
     params={
       "ball_cfg": SceneEntityCfg(BALL_NAME),
-      "vel_weight": 2.0,
-      "height_weight": 5.0,
-      "saturation_scale": 5.0,
       "dir_sigma": KICK_DIR_SIGMA_START,
+      "speed_sigma": KICK_SPEED_SIGMA_START,
+      "strictness": 0.0,
     },
   )
   # Rewards/penalizes the ball's post-kick direction against a randomly
@@ -615,18 +619,15 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "min_ball_speed": 0.1,
     },
   )
-  # Continuous kick intensity command (env.kick_intensity, see
-  # kick_contact_cycle and kick_intensity_obs). Adds a growing penalty once
-  # the ball goes past THIS life's own target speed
-  # (kick_intensity_to_target_speed(env.kick_intensity)) -- inert near
-  # intensity=1 since the target speed there is astronomically high, on top
-  # of the unchanged rewards above -- the robot must still strike the ball
-  # well, but must hold back on power for a low-intensity command.
-  cfg.rewards["kick_speed_cap"] = RewardTermCfg(
-    func=amp_mdp.kick_speed_cap_penalty,
-    weight=-50.0,
+  # Separate height reward (was part of kick_impact). Weight 5: a ball that
+  # leaves the ground by 0.5 m gives ~0.76 * 5 per second of window.
+  cfg.rewards["kick_height"] = RewardTermCfg(
+    func=amp_mdp.kick_height_reward,
+    weight=5.0,
     params={
       "ball_cfg": SceneEntityCfg(BALL_NAME),
+      "height_scale": 0.5,
+      "dir_sigma": KICK_DIR_SIGMA_START,
     },
   )
   # Bumped (was -0.2): a proper side-foot kick now pays off twice over --
@@ -729,6 +730,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "medial_signs": (1.0, -1.0),  # +Y medial for right, -Y medial for left (see rewards.py docstring).
       "window_s": KICK_WINDOW_S,
       "min_ball_travel": KICK_MIN_BALL_TRAVEL,
+      # A touch of 0.3 m/s (intensity 0) must open the kick window.
+      "impact_speed_threshold": 0.15,
       "dist_range": BALL_DIST_RANGE,
       "angle_range_deg": BALL_ANGLE_RANGE_DEG,
       "kick_dir_cone_deg": KICK_DIR_CONE_DEG,
@@ -824,6 +827,41 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     params={
       "reward_name": "kick_direction",
       "param_name": "sigma",
+      "start_step": 2000 * 24,
+      "end_step": 14000 * 24,
+      "start_value": KICK_DIR_SIGMA_START,
+      "end_value": KICK_DIR_SIGMA_END,
+    },
+  )
+  # Narrow the speed tolerance of kick_impact on the same schedule.
+  cfg.curriculum["narrow_kick_impact_speed"] = CurriculumTermCfg(
+    func=amp_mdp.anneal_reward_param_linear,
+    params={
+      "reward_name": "kick_impact",
+      "param_name": "speed_sigma",
+      "start_step": 2000 * 24,
+      "end_step": 14000 * 24,
+      "start_value": KICK_SPEED_SIGMA_START,
+      "end_value": KICK_SPEED_SIGMA_END,
+    },
+  )
+  # Strictness of kick_impact: 0 = every kick pays, 1 = signed quality.
+  cfg.curriculum["kick_impact_strictness"] = CurriculumTermCfg(
+    func=amp_mdp.anneal_reward_param_linear,
+    params={
+      "reward_name": "kick_impact",
+      "param_name": "strictness",
+      "start_step": 2000 * 24,
+      "end_step": 14000 * 24,
+      "start_value": 0.0,
+      "end_value": 1.0,
+    },
+  )
+  cfg.curriculum["narrow_kick_height_dir_gate"] = CurriculumTermCfg(
+    func=amp_mdp.anneal_reward_param_linear,
+    params={
+      "reward_name": "kick_height",
+      "param_name": "dir_sigma",
       "start_step": 2000 * 24,
       "end_step": 14000 * 24,
       "start_value": KICK_DIR_SIGMA_START,

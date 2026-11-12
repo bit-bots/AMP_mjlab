@@ -363,14 +363,14 @@ def kick_intensity_obs(
     """Commanded kick intensity for the current ball "life" (``env.kick_intensity``,
     set by ``kick_contact_cycle``/``_place_ball_near_robot``, mdp/events.py):
     a continuous value in [0, 1], nonlinearly mapped to a target ball speed
-    by ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- 0.0 -> 1 m/s,
+    by ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- 0.0 -> 0.3 m/s,
     0.5 -> 4 m/s, 1.0 -> unbounded ("as hard as possible").
 
     This is a task command, not a sensed quantity -- the actor must see the
     exact value it is being asked to act on. It goes to both the actor and
     critic groups with no noise, the same as a real commanded input would be.
-    ``kick_speed_cap_penalty`` (mdp/rewards.py) reads the same attribute to
-    penalize a trial where the ball ends up faster than its target speed.
+    ``kick_impact_reward`` (mdp/rewards.py) reads the same attribute to score
+    the ball speed against the target speed.
     """
     intensity = getattr(env, intensity_attr, None)
     if intensity is None:

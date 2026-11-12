@@ -874,63 +874,34 @@ def post_kick_velocity_penalty(
   return torch.where(active, speed_sq, torch.zeros_like(speed_sq))
 
 
-# Reference speed used by kick_impact_reward's extra low-intensity boost
-# below -- the intensity=0.5 point on the target-speed curve.
+# Target speed at kick intensity 0 (m/s). The ball then rolls only a few cm
+# (1 to 8 cm, depending on the rolling friction draw of the env).
+KICK_MIN_TARGET_SPEED = 0.3
+# Target speed at kick intensity 0.5 (m/s).
 KICK_REFERENCE_SPEED = 4.0
-# How much slow_kick_extra_boost amplifies the "reward for a slow, precise
-# kick" signal, applied to the excess above 1.0 so it stays exactly 1.0
-# (unchanged) at/above KICK_REFERENCE_SPEED -- see kick_impact_reward.
-SLOW_KICK_BOOST_MULTIPLIER = 5.0
+# From this target speed on, a kick counts as "as hard as possible": a ball that
+# is faster than the target is not wrong (see kick_impact_reward).
+KICK_MAX_TARGET_SPEED = 5.0
 
 
 def kick_intensity_to_target_speed(intensity: torch.Tensor) -> torch.Tensor:
-  """Continuous, nonlinear map from a per-life commanded kick intensity in
-  [0, 1] (``env.kick_intensity``, see ``kick_contact_cycle``/
-  ``_place_ball_near_robot``, mdp/events.py) to a target ball speed in m/s:
-  intensity=0.0 -> 2 m/s (the minimum -- a bare touch below this isn't worth
-  distinguishing from noise), intensity=0.5 -> 4 m/s (``KICK_REFERENCE_SPEED``),
-  intensity=1.0 -> +inf (an "as hard as possible" kick, no speed cap at all).
+  """Map a per-life commanded kick intensity in [0, 1] (``env.kick_intensity``,
+  see ``kick_contact_cycle``/``_place_ball_near_robot``, mdp/events.py) to a
+  target ball speed in m/s.
 
-  Solved from ``target(x) = a/(1-x)`` given ``target(0)=2`` and
-  ``target(0.5)=4``: ``a=2`` (the ``b`` term used by an earlier version of
-  this curve turned out to be exactly 0 once the floor moved from 1 to 2
-  m/s). At ``x=1`` this is a literal division by zero, which torch resolves
-  to ``+inf`` for a float tensor rather than raising -- and every consumer
-  below stays well-defined at ``+inf`` (``tanh(inf) == 1``, ``clamp(-inf,
-  min=0) == 0``, no NaNs), so no artificial cap is needed to represent
-  "infinitely strong".
+  - 0 to 0.5: geometric (log-uniform) from ``KICK_MIN_TARGET_SPEED`` (0.3 m/s,
+    a touch that rolls the ball a few cm) to ``KICK_REFERENCE_SPEED`` (4 m/s).
+  - 0.5 to 1: ``2 / (1 - intensity)``, from 4 m/s to +inf ("as hard as
+    possible"). This is the old curve, so it joins without a step at 0.5.
+
+  At ``intensity = 1`` the second branch divides by zero. Torch gives +inf for a
+  float tensor, and every consumer handles +inf (no NaN, no artificial cap).
   """
-  return 2.0 / (1.0 - intensity)
-
-
-def kick_speed_cap_penalty(
-  env: ManagerBasedRlEnv,
-  ball_cfg: SceneEntityCfg,
-  timer_attr: str = "kick_timer",
-  intensity_attr: str = "kick_intensity",
-) -> torch.Tensor:
-  """Penalize the ball going faster than the commanded intensity's target
-  speed (``kick_intensity_to_target_speed(env.kick_intensity)``) during the
-  post-kick window (``env.kick_timer`` > 0).
-
-  Grows linearly past the target speed (like ``foot_base_proximity_penalty``),
-  0 at or under it, so a full miss is not required to avoid the penalty --
-  only staying under the speed cap is. At ``env.kick_intensity`` near 1.0 the
-  target speed is astronomically high (see ``kick_intensity_to_target_speed``),
-  so this is effectively inert on a maximum-intensity trial -- replaces the
-  old fixed strong/weak split, where a strong trial was hard-exempted from any
-  penalty; now it's just never close to reachable instead.
-  """
-  ball: Entity = env.scene[ball_cfg.name]
-  ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
-  timer = getattr(env, timer_attr, None)
-  intensity = getattr(env, intensity_attr, None)
-  if timer is None or intensity is None:
-    return torch.zeros_like(ball_speed)
-  target_speed = kick_intensity_to_target_speed(intensity)
-  excess = torch.clamp(ball_speed - target_speed, min=0.0)
-  active = timer > 0
-  return torch.where(active, excess, torch.zeros_like(excess))
+  slow = KICK_MIN_TARGET_SPEED * (KICK_REFERENCE_SPEED / KICK_MIN_TARGET_SPEED) ** (
+    2.0 * intensity
+  )
+  fast = 2.0 / (1.0 - intensity)
+  return torch.where(intensity <= 0.5, slow, fast)
 
 
 def foot_medial_alignment(
@@ -981,71 +952,75 @@ def _kick_dir_factor(
   return (f_dir - 0.5) * 2.0
 
 
+def _kick_speed_factor(
+  speed: torch.Tensor, target_speed: torch.Tensor, sigma: float
+) -> torch.Tensor:
+  """Signed speed quality in [-1, 1], like ``_kick_dir_factor``: +1 at the
+  target speed, 0 at the tolerance boundary, -1 far away. The error is the log
+  of the speed ratio, so "too fast by a factor 2" and "too slow by a factor 2"
+  count the same, and the tolerance is relative (the same relative width for a
+  touch of 0.3 m/s and a kick of 4 m/s). ``sigma`` is in log units; the factor
+  is 0 at 1.18 * sigma (sigma 0.25: a speed 34 % off the target).
+
+  From ``KICK_MAX_TARGET_SPEED`` on, the target means "this fast or faster":
+  a faster ball is not an error.
+  """
+  one_sided = target_speed >= KICK_MAX_TARGET_SPEED
+  target = torch.clamp(target_speed, max=KICK_MAX_TARGET_SPEED)
+  err = torch.log(torch.clamp(speed, min=1e-3) / target)
+  err = torch.where(one_sided, torch.clamp(err, max=0.0), err)
+  return (torch.exp(-0.5 * torch.square(err / sigma)) - 0.5) * 2.0
+
+
 def kick_impact_reward(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg,
-  vel_weight: float = 1.0,
-  height_weight: float = 1.0,
-  saturation_scale: float = 5.0,
   dir_sigma: float = 0.5,
+  speed_sigma: float = 0.7,
+  strictness: float = 1.0,
+  near_scale: float = 1.8,
+  far_scale: float = 0.7,
 ) -> torch.Tensor:
-  """Reward ball speed + height while a post-contact reward window is open,
-  scaled by how well the foot was aligned with the ball at the moment of
-  contact (so a proper side-foot kick earns much more than a toe-poke/front
-  kick for the same ball speed/height) AND by how well the ball's resulting
-  direction matches the target (``env.kick_dir_world``) -- a kick outside the
-  direction tolerance doesn't just earn less, it goes negative (see
-  ``_kick_dir_factor``), so direction can't be ignored in favor of raw power.
+  """Reward for the quality of a kick during the post-contact window
+  (``env.kick_timer`` > 0), for the speed AND the direction of the ball.
 
-  Raw ``vel_weight*speed + height_weight*height`` is unbounded and was
-  swamping the AMP style term (hard-capped to ``[0, amp_reward_coef]``) in the
-  overall PPO reward -- the discriminator's contribution became numerically
-  irrelevant regardless of its lerp weight. ``tanh(raw / saturation_scale)``
-  smoothly bounds this term to [0, 1) (near-linear for small raw, saturating
-  as it grows), so with the reward term's outer ``weight`` set to 2.0 the
-  hardest possible kick still only reaches ~2 -- the same order of magnitude as
-  the other reward terms instead of dwarfing them.
+  The reward is ``style * quality``. ``style`` in [0, 1] is the foot
+  alignment at the moment of contact (``env.kick_style``). ``quality`` is built
+  from two signed factors, both +1 at the optimum, 0 at the tolerance boundary
+  and -1 far away:
 
-  ``dir_sigma`` is meant to be narrowed over training via a curriculum
-  (``anneal_reward_param_linear``, mdp/curriculums.py) alongside
-  ``kick_direction_reward``'s own sigma -- generous early (a wide "doesn't
-  count against you" cone) so the robot can discover kicking at all, then
-  tightening to demand real directional accuracy for full credit.
+  - the speed factor (``_kick_speed_factor``): the ball speed against the
+    target speed of the commanded intensity
+    (``kick_intensity_to_target_speed``). Too slow and too fast are both
+    negative. The optimum gives the same reward at every intensity.
+  - the direction factor (``_kick_dir_factor``): the ball direction against
+    ``env.kick_dir_world``.
 
-  The window (``env.kick_timer``, steps remaining), the frozen style
-  multiplier (``env.kick_style`` in [0, 1], see ``foot_medial_alignment``),
-  and the frozen foot-correctness flag (``env.kick_foot_correct``, see
-  ``select_kick_foot_is_left``) are owned and set by the
-  ``kick_contact_cycle`` event (mdp/events.py) -- opened on ball contact,
-  held for a few seconds so the robot can "farm" reward from the kick's
-  aftermath, then the event resets the ball. This function just reads that
-  shared per-env state; it holds no state of its own. Gated on
-  ``kick_foot_correct`` too: a kick with the wrong foot (per the current
-  ball position/target angle) shouldn't also collect this reward on top of
-  ``ball_kick_contact_reward``'s penalty for the same touch.
+  The factors are multiplied. If one of them is negative, the result is
+  negative or zero too (``-|speed * dir|``), so two bad factors do not give a
+  positive product.
 
-  A low-intensity life (``env.kick_intensity`` near 0, see
-  ``kick_contact_cycle``) is deliberately capped to a slow ball speed
-  (``kick_speed_cap_penalty``), so at low intensity this term earns much
-  less purely from lower speed -- left alone, the policy learns to skip
-  attempting soft kicks rather than take a real ball-approach risk for a
-  small reward. Two multiplicative boosts compensate:
+  The speed is the PEAK ball speed since the contact (``env.kick_peak_speed``),
+  not the present speed: the ball slows down by rolling friction during the
+  window, and the kick is what the foot gave it at the start.
 
-  - ``equalizing_boost = 1 / tanh(target_speed(intensity) * vel_weight /
-    saturation_scale)``: the reciprocal of how much this term's own
-    ``tanh`` saturation discounts a perfectly-hit kick AT the commanded
-    target speed, so a well-placed kick at any intensity would otherwise
-    score about the same. 1.0 at ``intensity=1`` (target speed +inf, tanh
-    saturates to 1 -- matches the old strong-kick behavior exactly).
-  - ``slow_kick_extra_boost = 1 + SLOW_KICK_BOOST_MULTIPLIER * (clamp(
-    KICK_REFERENCE_SPEED / target_speed, min=1.0) - 1)``: deliberately
-    breaks that equalization in favor of low intensity on top of it -- the
-    multiplier amplifies the excess above 1.0 so the boost stays exactly
-    1.0 (no change) at/above ``KICK_REFERENCE_SPEED`` (4 m/s), but reaches
-    ``1 + SLOW_KICK_BOOST_MULTIPLIER`` at the 2 m/s floor -- so soft,
-    precise kicks are worth dramatically more than just "equal to a hard
-    kick", giving the policy a strong incentive to learn power control
-    rather than just always kicking as hard as it can get away with.
+  ``strictness`` in [0, 1] (curriculum) blends a lenient reward with the
+  signed quality above. At 0, every kick with the correct foot gives a
+  positive reward (0.3 for a bad kick, 1.0 for a perfect kick), so the robot
+  finds kicks at all. At 1, the signed quality is used unchanged.
+
+  The reward is scaled by the target speed: ``near_scale`` for the weakest
+  kick (0.3 m/s) and ``far_scale`` for the hardest (``KICK_MAX_TARGET_SPEED``),
+  log-linear in between. Near kicks pay more, far kicks less. The mean over the
+  intensities is about 1.
+
+  ``dir_sigma`` and ``speed_sigma`` are meant to be narrowed over training with
+  ``anneal_reward_param_linear`` (mdp/curriculums.py): wide at first, so that
+  the robot finds kicks at all, then narrow, for an exact speed and direction.
+
+  The window, the style and the foot flag (``env.kick_foot_correct``) are
+  owned by the ``kick_contact_cycle`` event (mdp/events.py). A kick with the
+  wrong foot gets no reward from this term.
   """
   ball: Entity = env.scene[ball_cfg.name]
   timer = getattr(env, "kick_timer", None)
@@ -1053,44 +1028,87 @@ def kick_impact_reward(
   ball_speed = torch.norm(ball_vel_xy, dim=-1)
   if timer is None:
     return torch.zeros_like(ball_speed)
-  ball_height = torch.clamp(ball.data.root_link_pos_w[:, 2] - BALL_RADIUS, min=0.0)
   active = timer > 0
   foot_correct = getattr(env, "kick_foot_correct", None)
   if foot_correct is not None:
     active = active & foot_correct
   style = getattr(env, "kick_style", None)
   style = torch.ones_like(ball_speed) if style is None else style
-  raw = vel_weight * ball_speed + height_weight * ball_height
-  bounded = torch.tanh(raw / saturation_scale)
 
+  peak = getattr(env, "kick_peak_speed", None)
+  if peak is None:
+    peak = ball_speed.clone()
+  new_contact = getattr(env, "kick_new_contact", None)
+  peak = torch.maximum(peak, ball_speed)
+  if new_contact is not None:
+    peak = torch.where(new_contact, ball_speed, peak)
+  env.kick_peak_speed = peak
+
+  intensity = getattr(env, "kick_intensity", None)
+  if intensity is None:
+    speed_factor = torch.ones_like(ball_speed)
+  else:
+    speed_factor = _kick_speed_factor(
+      peak, kick_intensity_to_target_speed(intensity), speed_sigma
+    )
   kick_dir = getattr(env, "kick_dir_world", None)
   dir_factor = (
     torch.ones_like(ball_speed)
     if kick_dir is None
     else _kick_dir_factor(ball_vel_xy, kick_dir, dir_sigma)
   )
-  intensity = getattr(env, "kick_intensity", None)
-  if intensity is None:
-    boost = torch.ones_like(ball_speed)
-  else:
-    target_speed = kick_intensity_to_target_speed(intensity)
-    target_saturation = torch.clamp(
-      torch.tanh(target_speed * vel_weight / saturation_scale), min=1e-3
+  product = speed_factor * dir_factor
+  both_ok = (speed_factor >= 0.0) & (dir_factor >= 0.0)
+  quality = torch.where(both_ok, product, -torch.abs(product))
+  lenient = 0.3 + 0.35 * (quality + 1.0)
+  quality = (1.0 - strictness) * lenient + strictness * quality
+  if intensity is not None:
+    target = torch.clamp(
+      kick_intensity_to_target_speed(intensity),
+      KICK_MIN_TARGET_SPEED,
+      KICK_MAX_TARGET_SPEED,
     )
-    equalizing_boost = 1.0 / target_saturation
-    # Extra reward for a well-executed SLOW kick, on top of the equalizing
-    # boost above: floored at 1.0 (never reduces a kick at/above
-    # KICK_REFERENCE_SPEED), then the excess above 1.0 is amplified by
-    # SLOW_KICK_BOOST_MULTIPLIER -- reaching 1+SLOW_KICK_BOOST_MULTIPLIER at
-    # the minimum target speed (2 m/s) -- deliberately breaks the "any
-    # intensity scores about the same" equalization above in favor of low
-    # intensity, so the policy has a strong incentive to learn precise
-    # soft-kick control instead of defaulting to full power whenever it can
-    # get away with it.
-    slow_kick_ratio = torch.clamp(KICK_REFERENCE_SPEED / target_speed, min=1.0)
-    slow_kick_extra_boost = 1.0 + SLOW_KICK_BOOST_MULTIPLIER * (slow_kick_ratio - 1.0)
-    boost = equalizing_boost * slow_kick_extra_boost
-  return torch.where(active, style * bounded * dir_factor * boost, torch.zeros_like(ball_speed))
+    u = torch.log(target / KICK_MIN_TARGET_SPEED) / math.log(
+      KICK_MAX_TARGET_SPEED / KICK_MIN_TARGET_SPEED
+    )
+    quality = quality * (near_scale + (far_scale - near_scale) * u)
+  return torch.where(active, style * quality, torch.zeros_like(ball_speed))
+
+
+def kick_height_reward(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  height_scale: float = 0.5,
+  dir_sigma: float = 0.5,
+) -> torch.Tensor:
+  """Reward for the height of the ball during the post-contact window
+  (``env.kick_timer`` > 0): ``style * max(dir_factor, 0) * tanh(height /
+  height_scale)``, in [0, 1). It is separate from ``kick_impact_reward``, so
+  the speed band of that term does not cap how high the ball may fly. A ball
+  that goes in the wrong direction (``dir_factor`` < 0) gets 0, not a negative
+  value: the direction is already punished by the other terms. ``dir_sigma``
+  is narrowed with the same curriculum as the one of ``kick_impact_reward``.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  timer = getattr(env, "kick_timer", None)
+  ball_vel_xy = ball.data.root_link_lin_vel_w[:, :2]
+  ball_height = torch.clamp(ball.data.root_link_pos_w[:, 2] - BALL_RADIUS, min=0.0)
+  if timer is None:
+    return torch.zeros_like(ball_height)
+  active = timer > 0
+  foot_correct = getattr(env, "kick_foot_correct", None)
+  if foot_correct is not None:
+    active = active & foot_correct
+  style = getattr(env, "kick_style", None)
+  style = torch.ones_like(ball_height) if style is None else style
+  kick_dir = getattr(env, "kick_dir_world", None)
+  dir_factor = (
+    torch.ones_like(ball_height)
+    if kick_dir is None
+    else torch.clamp(_kick_dir_factor(ball_vel_xy, kick_dir, dir_sigma), min=0.0)
+  )
+  value = style * dir_factor * torch.tanh(ball_height / height_scale)
+  return torch.where(active, value, torch.zeros_like(value))
 
 
 def kick_direction_reward(

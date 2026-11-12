@@ -381,7 +381,7 @@ def _place_ball_near_robot(
             n, env.device, heading=robot_yaw, cone_deg=kick_dir_cone_deg
         )
     # ...and a fresh commanded kick intensity for this life (kick_intensity_obs,
-    # mdp/observations.py; kick_speed_cap_penalty/kick_impact_reward, mdp/rewards.py).
+    # mdp/observations.py; kick_impact_reward, mdp/rewards.py).
     if hasattr(env, "kick_intensity"):
         env.kick_intensity[env_ids] = sample_uniform(0.0, 1.0, (n,), device=env.device)
         # Color the ball by the new intent (linearly interpolated between
@@ -545,11 +545,10 @@ class kick_contact_cycle:
     [0, 1], resampled uniformly by ``_place_ball_near_robot`` every time the
     ball is repositioned, and mapped to a target ball speed by
     ``kick_intensity_to_target_speed`` (mdp/rewards.py) -- continuously from
-    a soft 1 m/s tap at 0.0 through a 4 m/s kick at 0.5 to an unbounded,
-    as-hard-as-possible kick at 1.0. Every life is penalized for exceeding
-    its own target speed (``kick_speed_cap_penalty``, mdp/rewards.py) --
-    inert at intensity=1 since the target speed there is astronomically
-    high. The policy sees the current value via ``kick_intensity_obs``
+    a 0.3 m/s touch at 0.0 through a 4 m/s kick at 0.5 to an unbounded,
+    as-hard-as-possible kick at 1.0. ``kick_impact_reward`` (mdp/rewards.py)
+    scores the ball speed against this target (too slow and too fast are both
+    negative). The policy sees the current value via ``kick_intensity_obs``
     (mdp/observations.py).
 
     Also computes, at the same moment: ``env.kick_new_contact`` (a
