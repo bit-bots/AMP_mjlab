@@ -557,7 +557,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # fighting the kick_impact incentive.
   cfg.rewards["joint_torques_l2"] = RewardTermCfg(
     func=amp_mdp.joint_torques_l2,
-    weight=-1.0e-5,
+    weight=-3.0e-6,  # was -1e-5
   )
   # ball_kick_contact/kick_impact bumped ~40x (2.0->80.0, 1.0->40.0): even
   # with AMP back at its original weight, the policy still converged to standing
