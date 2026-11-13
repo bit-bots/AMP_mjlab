@@ -472,7 +472,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # APPROACH_SLOT_* above) instead of the straight line to the ball.
   cfg.rewards["move_to_ball"] = RewardTermCfg(
     func=amp_mdp.move_along_approach_field,
-    weight=4.0,
+    weight=6.0,  # was 4.0; slow kicks get up to 2x more (slow_boost)
     params={
       "object_cfg": SceneEntityCfg(BALL_NAME),
       "anchor_cfg": SceneEntityCfg("robot", body_names=(ANCHOR_NAME,)),
@@ -485,6 +485,7 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "lane_strength": APPROACH_LANE_STRENGTH,
       "lane_behind_gain": APPROACH_LANE_BEHIND_GAIN,
       "max_speed": APPROACH_MAX_SPEED,
+      "slow_boost": 1.0,
     },
   )
   # Significant flat penalty for standing still before the ball's been
@@ -549,6 +550,14 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     func=amp_mdp.short_swing_penalty,
     weight=-80.0,
     params={"sensor_name": "feet_ground_contact", "min_air_time": MIN_SWING_PENALTY_S},
+  )
+  # Tiny torque penalty (not present anywhere in the kick task's reward set
+  # before this): mdp.joint_torques_l2 is mjlab's built-in L2 actuator-force
+  # cost, small enough to just discourage needlessly forceful motion without
+  # fighting the kick_impact incentive.
+  cfg.rewards["joint_torques_l2"] = RewardTermCfg(
+    func=amp_mdp.joint_torques_l2,
+    weight=-1.0e-5,
   )
   # ball_kick_contact/kick_impact bumped ~40x (2.0->80.0, 1.0->40.0): even
   # with AMP back at its original weight, the policy still converged to standing
@@ -747,6 +756,8 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # --- Curricula -------------------------------------------------------------
   # Tighten the foot-slip penalty at iteration 10000, once kicking is
   # established, to clean up the gait rather than fight exploration early on.
+  # (joint_torques_l2 used to also bump here -- moved to its own, much
+  # earlier and stronger bump below, alongside action_rate_l2.)
   cfg.curriculum["bump_penalties"] = CurriculumTermCfg(
     func=amp_mdp.bump_reward_weight_at_step,
     params={
@@ -755,13 +766,27 @@ def piplus_amp_kick_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "scale": 3.0,
     },
   )
-  # Action-rate penalty: base -0.01, x4 from iteration 3000 (-0.04), to clamp
-  # down on jerky motion before the kick-direction curriculum starts.
+  # Tighten the torque/action-rate penalties at iteration 3000 -- much
+  # earlier than the foot-slip bump above, to clamp down on jerky/forceful
+  # motion well before the kick-direction curriculum below starts demanding
+  # accuracy. scale=8.0 turned out too strong; brought down to a middle
+  # ground between that and no bump at all.
+  cfg.curriculum["bump_control_penalties"] = CurriculumTermCfg(
+    func=amp_mdp.bump_reward_weight_at_step,
+    params={
+      "reward_names": ["joint_torques_l2"],
+      "step": 3000 * 24,
+      "scale": 4.0,
+    },
+  )
+  # Action-rate penalty in three stages: base -0.01, x4 at iteration 3000 (as
+  # for the torque penalty above), and x8 at iteration 10000 (-0.08, twice the
+  # old final value). The late stage comes after kicking is established.
   cfg.curriculum["stage_action_rate"] = CurriculumTermCfg(
     func=amp_mdp.stage_reward_weight_scale,
     params={
       "reward_names": ["action_rate_l2"],
-      "stages": [(3000 * 24, 4.0)],
+      "stages": [(3000 * 24, 4.0), (10000 * 24, 8.0)],
     },
   )
   # Short-swing penalty: off until iteration 3000, half weight until 6000,

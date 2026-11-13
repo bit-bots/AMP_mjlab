@@ -480,6 +480,7 @@ def move_along_approach_field(
   keepout_push: float = 1.5,
   swirl: float = 1.0,
   swirl_width: float = 0.25,
+  slow_boost: float = 0.0,
 ) -> torch.Tensor:
   """Reward the anchor's velocity along the approach field (see
   ``approach_field``).
@@ -490,6 +491,11 @@ def move_along_approach_field(
   along the field is paid up to the field's own speed (which falls to zero at
   the slot), and motion against the field is penalized linearly. Uses the
   anchor's linear velocity, so turning in place earns nothing.
+
+  ``slow_boost`` scales the reward for weak kicks: the factor is
+  ``1 + slow_boost * w`` with ``w`` = 1 at the slowest target speed
+  (``KICK_MIN_TARGET_SPEED``) and 0 at ``KICK_REFERENCE_SPEED`` and above.
+  A slow kick needs a precise, calm approach, so the approach counts more.
   """
   robot: Entity = env.scene[anchor_cfg.name]
   ball: Entity = env.scene[object_cfg.name]
@@ -514,7 +520,16 @@ def move_along_approach_field(
   vx = vel[:, 0] * kick_dir[:, 0] + vel[:, 1] * kick_dir[:, 1]
   vy = -vel[:, 0] * kick_dir[:, 1] + vel[:, 1] * kick_dir[:, 0]
   along = vx * u[:, 0] + vy * u[:, 1]
-  return torch.minimum(along, field_speed)
+  reward = torch.minimum(along, field_speed)
+  intensity = getattr(env, "kick_intensity", None)
+  if slow_boost > 0.0 and intensity is not None:
+    v_target = kick_intensity_to_target_speed(intensity)
+    w = torch.clamp(
+      (KICK_REFERENCE_SPEED - v_target) / (KICK_REFERENCE_SPEED - KICK_MIN_TARGET_SPEED),
+      0.0, 1.0,
+    )
+    reward = reward * (1.0 + slow_boost * w)
+  return reward
 
 
 def torso_orient_to_object(
