@@ -429,6 +429,12 @@ class AmpOnPolicyRunner:
                     self.alg.compute_returns(privileged_obs)
 
             # update policy
+            # Switch the mirror loss off from this iteration on (data augmentation stays).
+            _sym = getattr(self.alg, "symmetry", None)
+            if _sym and _sym.get("mirror_loss_off_iteration") is not None:
+                if it >= _sym["mirror_loss_off_iteration"] and _sym["use_mirror_loss"]:
+                    _sym["use_mirror_loss"] = False
+                    print(f"[AMPPPO] mirror loss switched off at iteration {it}")
             loss_dict = self.alg.update()
 
             stop = time.time()

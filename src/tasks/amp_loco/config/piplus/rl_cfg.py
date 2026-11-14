@@ -139,6 +139,9 @@ class RslRlSymmetryCfg:
   # None: the mirror loss is the MSE. A float: the mirror loss is the Huber
   # loss with this delta on each element (bounded gradient).
   mirror_loss_huber_delta: float | None = None
+  # None: the mirror loss stays on. An int: the runner switches it off from this
+  # iteration on. The data augmentation (mirrored samples) stays on.
+  mirror_loss_off_iteration: int | None = None
 
 
 @dataclass
@@ -170,6 +173,7 @@ def piplus_amp_kick_ppo_symmetric_runner_cfg() -> RslRlAmpSymmetricRunnerCfg:
       use_data_augmentation=True,
       use_mirror_loss=True,
       mirror_loss_coeff=1.0,
+      mirror_loss_off_iteration=10_000,
       data_augmentation_func=(
         "src.tasks.amp_loco.config.piplus.kick_symmetry:augment_symmetries_piplus_kick"
       ),
