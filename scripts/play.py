@@ -256,7 +256,11 @@ def run_play(task_id: str, cfg: PlayConfig):
       policy = PolicyRandom()
   else:
     runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
-    runner = runner_cls(env, asdict(agent_cfg), device=device)
+    runner_cfg = asdict(agent_cfg)
+    # AMP runner: skip preloading the AMP expert clips, only training needs them.
+    if "amp_motion_files" in runner_cfg:
+      runner_cfg["amp_preload"] = False
+    runner = runner_cls(env, runner_cfg, device=device)
     runner.load(str(resume_path), load_optimizer=False)
     policy = runner.get_inference_policy(device=device)
 

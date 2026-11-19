@@ -174,6 +174,8 @@ class AmpOnPolicyRunner:
             anchor_name=train_cfg["amp_anchor_name"],
             all_body_names=all_body_names,
             device=self.device,
+            # play.py sets amp_preload=False: inference never uses the expert data.
+            preload=train_cfg.get("amp_preload", True),
         )
         amp_normalizer = Normalizer(amp_data.observation_dim)
         discriminator = Discriminator(

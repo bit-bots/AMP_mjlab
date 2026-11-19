@@ -14,7 +14,8 @@ class AMPLoader:
                  body_names: Sequence[str],
                  anchor_name: str,
                  all_body_names: Sequence[str],
-                 device: str = "cuda:0"):
+                 device: str = "cuda:0",
+                 preload: bool = True):
         """Load AMP motion data.
 
         Args:
@@ -25,6 +26,10 @@ class AMPLoader:
                 The index of each name in this list must match the body
                 dimension in the .npz arrays.
             device: Torch device.
+            preload: If False, only resolve the body indexes and skip loading
+                and converting the clips. ``observation_dim`` still works (it
+                only depends on the bodies), ``feed_forward_generator`` does
+                not. Used by play.py, which never trains the discriminator.
         """
         assert os.path.exists(motion_file), f"Invalid path: {motion_file}"
 
@@ -33,6 +38,11 @@ class AMPLoader:
         self._body_indexes = [all_names_list.index(n) for n in body_names]
         self._anchor_indexes = all_names_list.index(anchor_name)
         self._num_bodies = len(self._body_indexes)
+        self._preloaded = preload
+        if not preload:
+            self.motion_names = []
+            self._body_pos_b_list = []
+            return
 
         # 检查是文件还是文件夹
         if os.path.isfile(motion_file):
@@ -151,6 +161,7 @@ class AMPLoader:
         return obs_dim
 
     def feed_forward_generator(self, num_mini_batch, mini_batch_size):
+        assert self._preloaded, "AMPLoader was built with preload=False (play mode), it has no motion data."
         num_motions = len(self._body_pos_b_list)
         
         for batch_idx in range(num_mini_batch):
