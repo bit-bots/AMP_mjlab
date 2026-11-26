@@ -75,3 +75,21 @@ class DelayedTerminationManager(TerminationManager):
         self._delay_counters[self._delay_env_mask & ~dones] = 0
 
         return self._truncated_buf | self._terminated_buf
+
+# --- Ball-stopping task (state from ball_stop_cycle, mdp/events.py) ---------
+
+
+def ball_stop_done_success(env) -> torch.Tensor:
+    """The ball was touched and the hold time after contact has passed."""
+    flag = getattr(env, "bs_success", None)
+    if flag is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return flag.clone()
+
+
+def ball_stop_done_missed(env) -> torch.Tensor:
+    """The ball passed the robot, stopped short or rolled away without contact."""
+    flag = getattr(env, "bs_missed", None)
+    if flag is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return flag.clone()

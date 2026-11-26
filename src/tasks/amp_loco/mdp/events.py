@@ -476,15 +476,35 @@ def random_ball_push(
     if n == 0:
         return
     ball: Entity = env.scene[ball_cfg.name]
+    k, radius = _ball_roll_coeff(env, env_ids, ball)
+
+    lo, hi = distance_range
+    u = torch.rand(n, device=env.device)
+    distance = lo * (hi / lo) ** u
+    speed = torch.sqrt(distance * k)
+
+    heading = torch.rand(n, device=env.device) * (2.0 * math.pi)
+    direction = torch.stack([torch.cos(heading), torch.sin(heading)], dim=-1)
+    ball.write_root_link_velocity_to_sim(
+        _rolling_ball_velocity(direction, speed, radius), env_ids=env_ids
+    )
+
+
+def _ball_roll_coeff(
+    env: ManagerBasedRlEnv, env_ids: torch.Tensor, ball: Entity
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-env rolling-loss coefficient ``k`` (m/s^2 * 1/m) and ball radius.
+
+    A ball rolling without slip from speed ``v`` covers ``v^2 / k`` meters
+    before it stops (energy model of ``random_ball_push``, corrected by the
+    measured ``_ROLL_DISTANCE_RATIO``), with the env's own radius and rolling
+    friction draw.
+    """
     geom_id = ball.indexing.geom_ids[0]
     model = env.sim.model
     world = env_ids % model.geom_friction.shape[0]
     mu_r = model.geom_friction[world, geom_id, 2].clamp(min=1e-3)
     radius = model.geom_size[env_ids % model.geom_size.shape[0], geom_id, 0]
-
-    lo, hi = distance_range
-    u = torch.rand(n, device=env.device)
-    distance = lo * (hi / lo) ** u
     points = torch.tensor(_ROLL_FRICTION_POINTS, device=env.device)
     ratios = torch.tensor(_ROLL_DISTANCE_RATIO, device=env.device)
     # Piecewise-linear interpolation of the measured ratio (clamped at the ends).
@@ -492,17 +512,254 @@ def random_ball_push(
     idx = torch.clamp(torch.searchsorted(points, mu_c) - 1, 0, len(points) - 2)
     frac = (mu_c - points[idx]) / (points[idx + 1] - points[idx])
     ratio = ratios[idx] + frac * (ratios[idx + 1] - ratios[idx])
-    g = 9.81
-    speed = torch.sqrt(distance * mu_r * g / (0.7 * radius * ratio))
+    k = mu_r * 9.81 / (0.7 * radius * ratio)
+    return k, radius
 
-    heading = torch.rand(n, device=env.device) * (2.0 * math.pi)
-    direction = torch.stack([torch.cos(heading), torch.sin(heading)], dim=-1)
-    vel = torch.zeros((n, 6), device=env.device)
+
+def _rolling_ball_velocity(
+    direction: torch.Tensor, speed: torch.Tensor, radius: torch.Tensor
+) -> torch.Tensor:
+    """(n, 6) root velocity for a ball rolling without slip along the unit xy
+    ``direction`` at ``speed``: omega = (z_hat x v) / r, so sliding friction
+    does not eat part of the launch energy."""
+    vel = torch.zeros((direction.shape[0], 6), device=direction.device)
     vel[:, 0:2] = direction * speed.unsqueeze(-1)
-    # Rolling without slip on flat ground: omega = (z_hat x v) / r.
     vel[:, 3] = -direction[:, 1] * speed / radius
     vel[:, 4] = direction[:, 0] * speed / radius
-    ball.write_root_link_velocity_to_sim(vel, env_ids=env_ids)
+    return vel
+
+
+# ------------------------------------------------------------------
+# Ball-stopping task: one ball per episode, rolled at the robot
+#
+# Phases (env.bs_phase), updated by the ``ball_stop_cycle`` step event:
+#   BS_IDLE     ball rests at its spawn point, robot should stand still
+#   BS_INCOMING ball was launched toward the robot (after a random idle time)
+#   BS_CONTACT  the robot touched the ball; after a random hold time the
+#               episode ends successfully (env.bs_success)
+# A ball that passes the robot, stops short or rolls away without contact
+# sets env.bs_missed. Both flags end the episode (terminations.py).
+#
+# The step event runs after the rewards/terminations of a step (mjlab step
+# order: physics -> terminations -> rewards -> reset -> step events -> obs),
+# so rewards and terminations see the phase and flags of the previous step.
+# ------------------------------------------------------------------
+
+BS_IDLE = 0
+BS_INCOMING = 1
+BS_CONTACT = 2
+
+# (c, sliding, rolling, radius) exponents, see _ball_launch_speed.
+_LAUNCH_ROLL_CORRECTION = (-2.341, -0.47, 0.165, -0.934)
+
+
+def _ball_stop_state(env: ManagerBasedRlEnv) -> None:
+    """Create the per-env ball-stopping state on first use."""
+    if hasattr(env, "bs_phase"):
+        return
+    n, dev = env.num_envs, env.device
+    env.bs_phase = torch.zeros(n, dtype=torch.long, device=dev)
+    env.bs_launch_step = torch.zeros(n, dtype=torch.long, device=dev)
+    env.bs_hold_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    env.bs_phase_steps = torch.zeros(n, dtype=torch.long, device=dev)
+    env.bs_launch_origin = torch.zeros((n, 2), device=dev)
+    env.bs_launch_dir = torch.zeros((n, 2), device=dev)
+    env.bs_launch_dir[:, 0] = 1.0
+    env.bs_start_xy = torch.zeros((n, 2), device=dev)
+    env.bs_new_contact = torch.zeros(n, dtype=torch.bool, device=dev)
+    env.bs_success = torch.zeros(n, dtype=torch.bool, device=dev)
+    env.bs_missed = torch.zeros(n, dtype=torch.bool, device=dev)
+
+
+def _ball_launch_speed(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    ball: Entity,
+    path_len: torch.Tensor,
+    arrival_speed: torch.Tensor,
+    max_speed: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch speed so that the ball still has ``arrival_speed`` after
+    ``path_len`` meters, and the ball radius.
+
+    ``_ball_roll_coeff`` with an empirical correction (fit over 511 launches
+    with the kick task's ball DR, flat plane, no robot in the way):
+    real/predicted roll distance = exp(c) * slide^a * roll^b * radius^d.
+    Sliding friction is the main factor (higher -> shorter roll). Cuts the
+    spread of real/predicted from ~0.49 to ~0.21 (std of the log). Measured:
+    a requested arrival speed of 1.0 m/s gives 0.7-2.0 m/s (10-90 %), and
+    about 20 % of the balls stop short.
+    """
+    k, radius = _ball_roll_coeff(env, env_ids, ball)
+    geom_id = ball.indexing.geom_ids[0]
+    model = env.sim.model
+    fr = model.geom_friction[env_ids % model.geom_friction.shape[0], geom_id]
+    c, a, b, d = _LAUNCH_ROLL_CORRECTION
+    corr = math.exp(c) * fr[:, 0].pow(a) * fr[:, 2].clamp(min=1e-3).pow(b) * radius.pow(d)
+    k = k / corr
+    speed = torch.sqrt(arrival_speed.square() + path_len * k).clamp(max=max_speed)
+    return speed, radius
+
+
+def reset_ball_stop(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    robot_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    spawn_dist_range: tuple[float, float] = (2.0, 4.0),
+    spawn_bearing_deg: float = 0.0,
+    idle_time_range_s: tuple[float, float] = (1.0, 3.0),
+    hold_time_range_s: tuple[float, float] = (1.0, 2.0),
+    spawn_height_margin: float = 0.002,
+) -> None:
+    """Reset event: put the ball at rest ``spawn_dist_range`` meters from the
+    robot, at a bearing within +/- ``spawn_bearing_deg`` of the robot's
+    heading (0 = straight in front; set by a curriculum), and start the idle
+    phase. Draws this episode's idle time before the launch and hold time
+    after contact.
+
+    Must run after ``reset_from_motion`` (event dict order). Forces a
+    ``sim.forward()`` to read the robot pose just written there (see
+    ``reset_ball_near_robot``).
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    n = env_ids.shape[0]
+    if n == 0:
+        return
+    _ball_stop_state(env)
+    env.scene.write_data_to_sim()
+    env.sim.forward()
+    robot: Entity = env.scene[robot_cfg.name]
+    ball: Entity = env.scene[ball_cfg.name]
+    dev = env.device
+
+    robot_xy = robot.data.root_link_pos_w[env_ids, :2]
+    robot_yaw = robot.data.heading_w[env_ids]
+    dist = sample_uniform(spawn_dist_range[0], spawn_dist_range[1], (n,), device=dev)
+    half = math.radians(spawn_bearing_deg)
+    bearing = robot_yaw + sample_uniform(-half, half, (n,), device=dev)
+    to_spawn = torch.stack([torch.cos(bearing), torch.sin(bearing)], dim=-1)
+
+    radius = env.sim.model.geom_size[
+        env_ids % env.sim.model.geom_size.shape[0], ball.indexing.geom_ids[0], 0
+    ]
+    pose = torch.zeros((n, 7), device=dev)
+    pose[:, 0:2] = robot_xy + to_spawn * dist.unsqueeze(-1)
+    # On the ground (flat plane): a ball dropped from higher loses speed and
+    # spin sync on landing after the launch.
+    pose[:, 2] = env.scene.env_origins[env_ids, 2] + radius + spawn_height_margin
+    pose[:, 3] = 1.0
+    ball.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+    ball.write_root_link_velocity_to_sim(torch.zeros((n, 6), device=dev), env_ids=env_ids)
+
+    dt = env.step_dt
+    idle = sample_uniform(idle_time_range_s[0], idle_time_range_s[1], (n,), device=dev)
+    hold = sample_uniform(hold_time_range_s[0], hold_time_range_s[1], (n,), device=dev)
+    env.bs_phase[env_ids] = BS_IDLE
+    # Where the robot stands at the episode start (after RSI): the idle
+    # phase penalizes moving away from here (ball_stop_idle_displacement).
+    env.bs_start_xy[env_ids] = robot_xy
+    env.bs_launch_step[env_ids] = torch.round(idle / dt).long()
+    env.bs_hold_steps[env_ids] = torch.round(hold / dt).long().clamp(min=1)
+    env.bs_phase_steps[env_ids] = 0
+    env.bs_launch_origin[env_ids] = pose[:, 0:2]
+    env.bs_launch_dir[env_ids] = -to_spawn
+    env.bs_new_contact[env_ids] = False
+    env.bs_success[env_ids] = False
+    env.bs_missed[env_ids] = False
+
+
+def ball_stop_cycle(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    robot_cfg: SceneEntityCfg,
+    ball_cfg: SceneEntityCfg,
+    contact_sensor_name: str,
+    aim_std: float = 0.075,
+    aim_clip: float | None = None,
+    arrival_speed_range: tuple[float, float] = (0.5, 2.0),
+    max_launch_speed: float = 8.0,
+    miss_pass_dist: float = 0.5,
+    miss_stop_speed: float = 0.05,
+    miss_min_time_s: float = 0.5,
+    miss_max_dist: float = 6.0,
+) -> None:
+    """Step event: advance the ball-stopping phases (see the section comment).
+
+    - Idle -> incoming at the episode's launch step: the ball is rolled from
+      where it lies toward the robot base, with a lateral aim offset
+      ~ N(0, ``aim_std``), clipped to +/- ``aim_clip`` meters unless None (perpendicular to
+      the path), so that it arrives with ``arrival_speed_range`` m/s
+      (approximate, see ``_ball_launch_speed``).
+    - Incoming -> contact on the first robot-ball contact
+      (``contact_sensor_name``, any substep of the step). Sets the one-step
+      flag ``env.bs_new_contact``.
+    - Contact -> ``env.bs_success`` after the episode's hold time.
+    - Incoming -> ``env.bs_missed`` when the ball is ``miss_pass_dist`` past
+      the robot along its path, slower than ``miss_stop_speed`` after
+      ``miss_min_time_s``, or farther than ``miss_max_dist`` from the robot.
+    """
+    del env_ids
+    _ball_stop_state(env)
+    robot: Entity = env.scene[robot_cfg.name]
+    ball: Entity = env.scene[ball_cfg.name]
+    dev = env.device
+
+    # Steps of this episode so far; 0 for envs reset in this step, whose
+    # contact sensor data still comes from the previous episode.
+    fresh = env.episode_length_buf == 0
+    env.bs_new_contact[:] = False
+    env.bs_phase_steps += 1
+
+    robot_xy = robot.data.root_link_pos_w[:, :2]
+    ball_xy = ball.data.root_link_pos_w[:, :2]
+    ball_speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
+
+    # --- contact (incoming only) -------------------------------------------
+    touched = contact_sensor_touched(env.scene[contact_sensor_name]) & ~fresh
+    new_contact = touched & (env.bs_phase == BS_INCOMING)
+    env.bs_new_contact[:] = new_contact
+    env.bs_phase[new_contact] = BS_CONTACT
+    env.bs_phase_steps[new_contact] = 0
+
+    # --- success after the hold time ------------------------------------------
+    env.bs_success |= (env.bs_phase == BS_CONTACT) & (env.bs_phase_steps >= env.bs_hold_steps)
+
+    # --- miss -----------------------------------------------------------------
+    incoming = env.bs_phase == BS_INCOMING
+    past = ((ball_xy - robot_xy) * env.bs_launch_dir).sum(-1) > miss_pass_dist
+    stopped = (ball_speed < miss_stop_speed) & (
+        env.bs_phase_steps * env.step_dt > miss_min_time_s
+    )
+    away = torch.norm(ball_xy - robot_xy, dim=-1) > miss_max_dist
+    env.bs_missed |= incoming & (past | stopped | away)
+
+    # --- launch ---------------------------------------------------------------
+    launch = (env.bs_phase == BS_IDLE) & (env.episode_length_buf >= env.bs_launch_step)
+    ids = launch.nonzero(as_tuple=False).squeeze(-1)
+    if ids.numel() == 0:
+        return
+    n = ids.shape[0]
+    to_robot = robot_xy[ids] - ball_xy[ids]
+    dist = torch.norm(to_robot, dim=-1).clamp(min=1e-6)
+    u = to_robot / dist.unsqueeze(-1)
+    lateral = torch.stack([-u[:, 1], u[:, 0]], dim=-1)
+    offset = torch.randn(n, device=dev) * aim_std
+    if aim_clip is not None:
+        offset = offset.clamp(-aim_clip, aim_clip)
+    path = to_robot + lateral * offset.unsqueeze(-1)
+    path_len = torch.norm(path, dim=-1).clamp(min=1e-6)
+    direction = path / path_len.unsqueeze(-1)
+    v_arr = sample_uniform(arrival_speed_range[0], arrival_speed_range[1], (n,), device=dev)
+    speed, radius = _ball_launch_speed(env, ids, ball, path_len, v_arr, max_launch_speed)
+    ball.write_root_link_velocity_to_sim(
+        _rolling_ball_velocity(direction, speed, radius), env_ids=ids
+    )
+    env.bs_phase[ids] = BS_INCOMING
+    env.bs_phase_steps[ids] = 0
+    env.bs_launch_origin[ids] = ball_xy[ids]
+    env.bs_launch_dir[ids] = direction
 
 
 @requires_model_fields("geom_rgba")

@@ -1147,3 +1147,144 @@ def self_collision_cost(
   return data.found.squeeze(-1)
 
 
+
+
+# --- Ball-stopping task ------------------------------------------------------
+# Phases and flags come from ball_stop_cycle (mdp/events.py). That step event
+# runs after the rewards, so every term here sees the phase of the previous
+# step (one step = 0.02 s lag, the same for all terms).
+
+_BS_IDLE, _BS_INCOMING, _BS_CONTACT = 0, 1, 2
+
+
+def _bs_phase_is(env: ManagerBasedRlEnv, phase: int) -> torch.Tensor:
+  p = getattr(env, "bs_phase", None)
+  if p is None:
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  return p == phase
+
+
+def _base_planar_speed_sq(robot: Entity) -> torch.Tensor:
+  """|v_xy|^2 + w_z^2 of the root (base_link), world frame."""
+  v = robot.data.root_link_lin_vel_w[:, :2]
+  w = robot.data.root_link_ang_vel_w[:, 2]
+  return v.square().sum(-1) + w.square()
+
+
+def ball_stop_idle_still(
+  env: ManagerBasedRlEnv,
+  std: float = 0.2,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Idle phase (ball not launched yet): exp(-(|v_xy|^2 + w_z^2) / std^2) of
+  the base, so standing still scores 1. 0 in the other phases."""
+  robot: Entity = env.scene[robot_cfg.name]
+  r = torch.exp(-_base_planar_speed_sq(robot) / std**2)
+  return r * _bs_phase_is(env, _BS_IDLE).float()
+
+
+def ball_stop_idle_displacement(
+  env: ManagerBasedRlEnv,
+  tolerance: float = 0.25,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Idle phase: how far (m) the base has moved away from where it stood at
+  the episode start (env.bs_start_xy), beyond ``tolerance``. Use with a
+  negative weight: the robot must stay in place until the ball is launched,
+  not walk to the ball early.
+
+  The tolerance absorbs the drift right after reset: episodes start from
+  walk/run clip frames (RSI), so the robot may still be moving a bit.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  start = getattr(env, "bs_start_xy", None)
+  if start is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  d = torch.norm(robot.data.root_link_pos_w[:, :2] - start, dim=-1)
+  return torch.clamp(d - tolerance, min=0.0) * _bs_phase_is(env, _BS_IDLE).float()
+
+
+def ball_stop_intercept(
+  env: ManagerBasedRlEnv,
+  max_speed: float = 0.5,
+  on_line_tol: float = 0.05,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Incoming phase: reward for moving the base toward the closest point on
+  the ball's path (the straight launch line, env.bs_launch_origin +
+  t * env.bs_launch_dir).
+
+  Base velocity toward that point, clipped to [0, ``max_speed``] and
+  normalized to [0, 1]. Already within ``on_line_tol`` of the line: 1.
+  0 in the other phases.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  incoming = _bs_phase_is(env, _BS_INCOMING)
+  if not incoming.any():
+    return torch.zeros(env.num_envs, device=env.device)
+  p = robot.data.root_link_pos_w[:, :2]
+  o, d = env.bs_launch_origin, env.bs_launch_dir
+  closest = o + d * ((p - o) * d).sum(-1, keepdim=True)
+  to_line = closest - p
+  dist = torch.norm(to_line, dim=-1)
+  u = to_line / dist.clamp(min=1e-6).unsqueeze(-1)
+  v_toward = (robot.data.root_link_lin_vel_w[:, :2] * u).sum(-1)
+  r = torch.clamp(v_toward, 0.0, max_speed) / max_speed
+  r = torch.where(dist < on_line_tol, torch.ones_like(r), r)
+  return r * incoming.float()
+
+
+def ball_stop_contact(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """One-shot: 1 in the step after the first robot-ball contact."""
+  flag = getattr(env, "bs_new_contact", None)
+  if flag is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  return flag.float()
+
+
+def ball_stop_post_contact_ball_speed(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg,
+  behind_scale: float = 2.0,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """After contact: ball speed |v_xy| (m/s), times ``behind_scale`` while
+  the ball is behind the robot (negative x in the base's heading frame), so
+  a ball that got through or past the robot costs more than one in front.
+  Use with a negative weight."""
+  ball: Entity = env.scene[ball_cfg.name]
+  robot: Entity = env.scene[robot_cfg.name]
+  speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
+  rel = ball.data.root_link_pos_w[:, :2] - robot.data.root_link_pos_w[:, :2]
+  h = robot.data.heading_w
+  x_fwd = torch.cos(h) * rel[:, 0] + torch.sin(h) * rel[:, 1]
+  scale = torch.where(x_fwd < 0.0, torch.full_like(speed, behind_scale), torch.ones_like(speed))
+  return speed * scale * _bs_phase_is(env, _BS_CONTACT).float()
+
+
+def ball_stop_post_contact_robot_motion(
+  env: ManagerBasedRlEnv,
+  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """After contact: |v_xy|^2 + w_z^2 of the base. Use with a negative weight."""
+  robot: Entity = env.scene[robot_cfg.name]
+  return _base_planar_speed_sq(robot) * _bs_phase_is(env, _BS_CONTACT).float()
+
+
+def ball_stop_success(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """One-shot: 1 in the step the episode ends successfully (same flag as the
+  ball_stop_success termination)."""
+  flag = getattr(env, "bs_success", None)
+  if flag is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  return flag.float()
+
+
+def terminated_by(env: ManagerBasedRlEnv, term_names: list[str]) -> torch.Tensor:
+  """1 if any of the named termination terms fired this step. Replaces
+  is_terminated where some terminations (e.g. success) must not be
+  penalized."""
+  out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  for name in term_names:
+    out |= env.termination_manager.get_term(name)
+  return out.float()

@@ -201,3 +201,79 @@ def bump_reward_weight_at_step(
     term_cfg = env.reward_manager.get_term_cfg(name)
     term_cfg.weight = _base_weight(term_cfg) * (scale if past else 1.0)
   return torch.tensor(scale if past else 1.0)
+
+
+def stage_event_param(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  event_name: str,
+  param_name: str,
+  stages: list[tuple[int, float]],
+) -> torch.Tensor:
+  """Set an event term's param by stages: ``stages`` is a list of
+  (step, value); the last stage whose step ``env.common_step_counter`` has
+  passed wins. Steps are env steps (iteration * num_steps_per_env)."""
+  del env_ids
+  value = stages[0][1]
+  for step, stage_value in stages:
+    if env.common_step_counter >= step:
+      value = stage_value
+  env.event_manager.get_term_cfg(event_name).params[param_name] = value
+  return torch.tensor(float(value))
+
+
+def ball_stop_aim_curriculum(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  event_name: str,
+  stages: list[float],
+  promote_rate: float = 0.6,
+  eval_episodes: int = 20_000,
+  ball_name: str = "ball",
+  robot_name: str = "robot",
+) -> dict[str, torch.Tensor]:
+  """Ball-stopping aim sigma by stages, promoted by performance.
+
+  An episode counts as good when it ended successfully (``env.bs_success``)
+  and at that moment the ball is not behind the robot (x >= 0 in the robot's
+  heading frame). How far in front and how fast it still rolls do not
+  matter. All other ended episodes (miss, fall, timeout) count as failures.
+
+  Runs before the reset events, so the ball / flags still show the end of
+  the finished episode. Every ``eval_episodes`` ended episodes the rate is
+  checked; at ``>= promote_rate`` the next stage's sigma is written into the
+  ``aim_std`` param of ``event_name``. Stages only go up.
+  """
+  if not hasattr(env, "bs_aim_stage"):
+    env.bs_aim_stage = 0
+    env.bs_aim_eps = 0
+    env.bs_aim_good = 0
+    env.bs_aim_last_rate = 0.0
+  params = env.event_manager.get_term_cfg(event_name).params
+  params["aim_std"] = stages[env.bs_aim_stage]
+
+  # First reset (before any episode) or nothing to count.
+  if hasattr(env, "bs_success") and not isinstance(env_ids, slice) and env.common_step_counter > 0:
+    ids = env_ids
+    if ids.numel() > 0:
+      robot = env.scene[robot_name]
+      ball = env.scene[ball_name]
+      d = ball.data.root_link_pos_w[ids, :2] - robot.data.root_link_pos_w[ids, :2]
+      fwd = robot.data.heading_w[ids]
+      x = d[:, 0] * torch.cos(fwd) + d[:, 1] * torch.sin(fwd)
+      good = env.bs_success[ids] & (x >= 0.0)
+      env.bs_aim_eps += int(ids.numel())
+      env.bs_aim_good += int(good.sum().item())
+      if env.bs_aim_eps >= eval_episodes:
+        env.bs_aim_last_rate = env.bs_aim_good / env.bs_aim_eps
+        if env.bs_aim_last_rate >= promote_rate and env.bs_aim_stage < len(stages) - 1:
+          env.bs_aim_stage += 1
+          params["aim_std"] = stages[env.bs_aim_stage]
+        env.bs_aim_eps = 0
+        env.bs_aim_good = 0
+
+  return {
+    "stage": torch.tensor(float(env.bs_aim_stage)),
+    "aim_std": torch.tensor(float(stages[env.bs_aim_stage])),
+    "not_behind_rate": torch.tensor(float(env.bs_aim_last_rate)),
+  }

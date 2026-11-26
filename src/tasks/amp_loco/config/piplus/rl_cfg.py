@@ -125,6 +125,31 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
   )
 
 
+# AMP reference clips for the ball-stopping task (subfolder of
+# src/assets/motions/piplus/amp/). There are no ball-stopping clips yet, so
+# the discriminator trains on the walk/run clips.
+BALL_STOP_AMP_MOTION_SUBDIR = "WalkandRun"
+
+
+def piplus_amp_ball_stop_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
+  """Ball-stopping task: same PPO/AMP setup as the walk task, own experiment
+  and wandb project. amp_reward_coef / amp_task_reward_lerp start at the kick
+  task's values (0.16 / 0.30); retune once the task rewards are in."""
+  base = piplus_amp_ppo_runner_cfg()
+  return dataclasses.replace(
+    base,
+    experiment_name="piplus_amp_ball_stop",
+    wandb_project="piplus_amp_ball_stop",
+    amp_motion_files=os.path.normpath(
+      os.path.join(_MOTION_DATA_DIR, BALL_STOP_AMP_MOTION_SUBDIR)
+    ),
+    amp_reward_coef=0.16,
+    amp_task_reward_lerp=0.30,
+    save_interval=500,
+    max_iterations=30_000,
+  )
+
+
 @dataclass
 class RslRlSymmetryCfg:
   """Symmetry settings that rsl_rl PPO/AMPPPO read from ``symmetry_cfg``.

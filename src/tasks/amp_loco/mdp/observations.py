@@ -151,6 +151,7 @@ def object_pos_b_noisy(
     timer_attr: str = "kick_timer",
     range_noise_std: float = 0.2,
     bearing_noise_std_deg: float = 5.0,
+    std_per_m: float = 0.0,
 ) -> torch.Tensor:
     """Actor-only noisy variant of ``object_pos_b``: much noisier during the
     post-kick phase (``timer_attr`` on ``env`` > 0, see ``kick_state_obs``)
@@ -175,6 +176,10 @@ def object_pos_b_noisy(
     ``ObservationTermCfg.noise`` pipeline (a single fixed ``GaussianNoiseCfg``
     can't vary by state); ``ObservationTermCfg.delay_max_lag`` still applies
     downstream as normal.
+
+    ``std_per_m``: the isotropic std grows by this much per meter of true
+    horizontal range (``std + std_per_m * r``), so a far ball is noisier
+    than a close one. 0 (default) keeps the std flat.
     """
     pos_b = object_pos_b(env, object_cfg, anchor_cfg)
 
@@ -198,6 +203,7 @@ def object_pos_b_noisy(
         torch.full_like(pos_b[:, 0], std_post_kick),
         torch.full_like(pos_b[:, 0], std),
     )
+    sigma = sigma + std_per_m * r
     return pos_b + torch.randn_like(pos_b) * sigma.unsqueeze(-1)
 
 
@@ -375,3 +381,32 @@ def robot_body_ang_vel_b(
     ).reshape(env.num_envs, num_bodies, 3)
 
     return body_ang_vel_b.reshape(env.num_envs, -1)
+
+def ball_stop_state_obs(
+    env: ManagerBasedRlEnv, incoming_horizon_s: float = 4.0
+) -> torch.Tensor:
+    """Critic-only ball-stopping state (ball_stop_cycle, mdp/events.py):
+    ``[idle, incoming, contact, progress]``.
+
+    One-hot phase plus the progress within the phase, in [0, 1]:
+    - idle: fraction of the idle time before the launch that has passed,
+    - incoming: time since the launch / ``incoming_horizon_s`` (clipped),
+    - contact: fraction of the hold time before success that has passed.
+
+    Privileged (asymmetric actor-critic): the real robot has no phase or
+    timer, so the actor must not get this. It lets the value function tell
+    apart states that look the same but differ in pending reward, e.g. a
+    resting ball at the foot after contact (success bonus coming) vs. without
+    contact (missed, episode about to end).
+    """
+    phase = getattr(env, "bs_phase", None)
+    if phase is None:
+        return torch.zeros(env.num_envs, 4, device=env.device)
+    onehot = torch.nn.functional.one_hot(phase, num_classes=3).float()
+    steps = env.bs_phase_steps.float()
+    idle_prog = env.episode_length_buf.float() / env.bs_launch_step.float().clamp(min=1.0)
+    incoming_prog = steps * env.step_dt / incoming_horizon_s
+    contact_prog = steps / env.bs_hold_steps.float().clamp(min=1.0)
+    progress = torch.stack([idle_prog, incoming_prog, contact_prog], dim=-1)
+    progress = (progress * onehot).sum(-1, keepdim=True).clamp(0.0, 1.0)
+    return torch.cat([onehot, progress], dim=-1)
