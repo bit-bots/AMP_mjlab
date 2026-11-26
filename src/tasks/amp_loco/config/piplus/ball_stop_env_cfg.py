@@ -79,12 +79,13 @@ BALL_ARRIVAL_SPEED_RANGE = (0.5, 2.0)
 # clipped (BALL_AIM_CLIP = None; a float clips to +/- that value).
 BALL_AIM_CLIP = None
 # Aim sigma curriculum (m): next stage once at least BALL_AIM_PROMOTE_RATE of
-# the ended episodes were a success with the ball NOT behind the robot at the
-# end (x >= 0 in the robot frame; distance and speed do not matter). The
-# model_24000 policy reaches ~66-69 %, hence 0.75. Checked every
+# the ended episodes were a success with the ball NOT behind the robot's
+# start position at the end (not past it along the launch direction;
+# distance and speed do not matter). The
+# threshold 0.65. Checked every
 # BALL_AIM_EVAL_EPISODES ended episodes (~45 iterations at 4096 envs).
 BALL_AIM_STD_STAGES = [0.25, 0.375, 0.5]
-BALL_AIM_PROMOTE_RATE = 0.75
+BALL_AIM_PROMOTE_RATE = 0.65
 BALL_AIM_EVAL_EPISODES = 20_000
 BALL_AIM_STD = BALL_AIM_STD_STAGES[0]
 # Ball friction: kick-env ranges (log-uniform), but a share of the balls
@@ -310,12 +311,14 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     weight=-10.0,
     params={"tolerance": 0.25},
   )
-  # Ball incoming: move the base toward the closest point on the ball's path,
-  # normalized to [0, 1] (1 at max_speed or once on the line).
+  # Ball incoming: step SIDEWAYS (across the ball's path) toward where the
+  # path crosses the robot's start line; moving along the path earns nothing.
+  # Normalized to [0, 1] (1 at max_speed, or on the path within
+  # start_line_tol of the start line).
   cfg.rewards["bs_intercept"] = RewardTermCfg(
     func=amp_mdp.ball_stop_intercept,
     weight=2.0,
-    params={"max_speed": 0.5, "on_line_tol": 0.05},
+    params={"max_speed": 0.5, "on_line_tol": 0.05, "start_line_tol": 0.15},
   )
   # First robot-ball contact: one-shot, 250 * 0.02 = 5.
   cfg.rewards["bs_contact"] = RewardTermCfg(
@@ -414,6 +417,12 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["reset_from_motion"].params["motion_dir"] = _motion_dir
 
   if play:
+    # PLAY_AIM_STAGE=<n> starts the aim sigma curriculum at stage n (the
+    # stage is not saved in the checkpoint, so play always starts at 0).
+    _stage = int(os.environ.get("PLAY_AIM_STAGE", "0"))
+    _stages = BALL_AIM_STD_STAGES[min(_stage, len(BALL_AIM_STD_STAGES) - 1):]
+    cfg.curriculum["ball_aim_std"].params["stages"] = _stages
+    cfg.events["ball_stop_cycle"].params["aim_std"] = _stages[0]
     # Ghost ball at the position the actor observes (noise + delay).
     cfg.scene.entities["ball_ghost"] = get_ball_ghost_cfg()
     cfg.events["ball_obs_ghost"] = EventTermCfg(

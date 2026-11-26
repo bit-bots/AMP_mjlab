@@ -230,14 +230,14 @@ def ball_stop_aim_curriculum(
   promote_rate: float = 0.6,
   eval_episodes: int = 20_000,
   ball_name: str = "ball",
-  robot_name: str = "robot",
 ) -> dict[str, torch.Tensor]:
   """Ball-stopping aim sigma by stages, promoted by performance.
 
   An episode counts as good when it ended successfully (``env.bs_success``)
-  and at that moment the ball is not behind the robot (x >= 0 in the robot's
-  heading frame). How far in front and how fast it still rolls do not
-  matter. All other ended episodes (miss, fall, timeout) count as failures.
+  and at that moment the ball is not behind the robot's START position
+  (``ball_behind_start``: not past it along the launch direction), no
+  matter where the robot is now. How far in front and how fast it still
+  rolls do not matter. All other ended episodes (miss, fall, timeout) count as failures.
 
   Runs before the reset events, so the ball / flags still show the end of
   the finished episode. Every ``eval_episodes`` ended episodes the rate is
@@ -256,12 +256,10 @@ def ball_stop_aim_curriculum(
   if hasattr(env, "bs_success") and not isinstance(env_ids, slice) and env.common_step_counter > 0:
     ids = env_ids
     if ids.numel() > 0:
-      robot = env.scene[robot_name]
+      from .rewards import ball_behind_start
+
       ball = env.scene[ball_name]
-      d = ball.data.root_link_pos_w[ids, :2] - robot.data.root_link_pos_w[ids, :2]
-      fwd = robot.data.heading_w[ids]
-      x = d[:, 0] * torch.cos(fwd) + d[:, 1] * torch.sin(fwd)
-      good = env.bs_success[ids] & (x >= 0.0)
+      good = env.bs_success[ids] & ~ball_behind_start(env, ball, ids)
       env.bs_aim_eps += int(ids.numel())
       env.bs_aim_good += int(good.sum().item())
       if env.bs_aim_eps >= eval_episodes:

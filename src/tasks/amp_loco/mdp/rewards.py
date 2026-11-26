@@ -1208,15 +1208,21 @@ def ball_stop_intercept(
   env: ManagerBasedRlEnv,
   max_speed: float = 0.5,
   on_line_tol: float = 0.05,
+  start_line_tol: float = 0.15,
   robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Incoming phase: reward for moving the base toward the closest point on
-  the ball's path (the straight launch line, env.bs_launch_origin +
-  t * env.bs_launch_dir).
+  """Incoming phase: reward for stepping SIDEWAYS into the ball's path.
 
-  Base velocity toward that point, clipped to [0, ``max_speed``] and
-  normalized to [0, 1]. Already within ``on_line_tol`` of the line: 1.
-  0 in the other phases.
+  Target: where the ball's path (the straight launch line,
+  env.bs_launch_origin + t * env.bs_launch_dir) crosses the lateral line
+  through the robot's start position (env.bs_start_xy, perpendicular to the
+  launch direction). Only the base velocity across the ball's path, toward
+  the target, counts: clipped to [0, ``max_speed``] and normalized to [0, 1].
+  Moving along the path (toward the ball or back) earns nothing.
+
+  1 when within ``on_line_tol`` of the path AND within ``start_line_tol`` of
+  the start line along the path (so standing on the path after running
+  toward the ball does not pay). 0 in the other phases.
   """
   robot: Entity = env.scene[robot_cfg.name]
   incoming = _bs_phase_is(env, _BS_INCOMING)
@@ -1224,13 +1230,15 @@ def ball_stop_intercept(
     return torch.zeros(env.num_envs, device=env.device)
   p = robot.data.root_link_pos_w[:, :2]
   o, d = env.bs_launch_origin, env.bs_launch_dir
-  closest = o + d * ((p - o) * d).sum(-1, keepdim=True)
-  to_line = closest - p
-  dist = torch.norm(to_line, dim=-1)
-  u = to_line / dist.clamp(min=1e-6).unsqueeze(-1)
-  v_toward = (robot.data.root_link_lin_vel_w[:, :2] * u).sum(-1)
+  n = torch.stack([-d[:, 1], d[:, 0]], dim=-1)  # lateral unit vector
+  target = o + d * ((env.bs_start_xy - o) * d).sum(-1, keepdim=True)
+  lat_err = ((target - p) * n).sum(-1)  # signed lateral distance to the path
+  along = ((p - env.bs_start_xy) * d).sum(-1)  # offset from start line
+  v_lat = (robot.data.root_link_lin_vel_w[:, :2] * n).sum(-1)
+  v_toward = v_lat * torch.sign(lat_err)
   r = torch.clamp(v_toward, 0.0, max_speed) / max_speed
-  r = torch.where(dist < on_line_tol, torch.ones_like(r), r)
+  on_target = (lat_err.abs() < on_line_tol) & (along.abs() < start_line_tol)
+  r = torch.where(on_target, torch.ones_like(r), r)
   return r * incoming.float()
 
 
@@ -1242,23 +1250,30 @@ def ball_stop_contact(env: ManagerBasedRlEnv) -> torch.Tensor:
   return flag.float()
 
 
+def ball_behind_start(env: ManagerBasedRlEnv, ball: Entity, env_ids=slice(None)) -> torch.Tensor:
+  """True where the ball is behind the robot's START position: projected on
+  the ball's launch direction, it has passed the point where the robot stood
+  at the episode start (``env.bs_start_xy``). Independent of where the robot
+  is or faces now, so stepping back or turning does not move "behind"."""
+  rel = ball.data.root_link_pos_w[env_ids, :2] - env.bs_start_xy[env_ids]
+  return (rel * env.bs_launch_dir[env_ids]).sum(-1) > 0.0
+
+
 def ball_stop_post_contact_ball_speed(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg,
   behind_scale: float = 2.0,
-  robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """After contact: ball speed |v_xy| (m/s), times ``behind_scale`` while
-  the ball is behind the robot (negative x in the base's heading frame), so
-  a ball that got through or past the robot costs more than one in front.
+  the ball is behind the robot's start position (``ball_behind_start``), so
+  a ball that got through or past costs more than one in front.
   Use with a negative weight."""
   ball: Entity = env.scene[ball_cfg.name]
-  robot: Entity = env.scene[robot_cfg.name]
   speed = torch.norm(ball.data.root_link_lin_vel_w[:, :2], dim=-1)
-  rel = ball.data.root_link_pos_w[:, :2] - robot.data.root_link_pos_w[:, :2]
-  h = robot.data.heading_w
-  x_fwd = torch.cos(h) * rel[:, 0] + torch.sin(h) * rel[:, 1]
-  scale = torch.where(x_fwd < 0.0, torch.full_like(speed, behind_scale), torch.ones_like(speed))
+  if not hasattr(env, "bs_start_xy"):
+    return torch.zeros_like(speed)
+  behind = ball_behind_start(env, ball)
+  scale = torch.where(behind, torch.full_like(speed, behind_scale), torch.ones_like(speed))
   return speed * scale * _bs_phase_is(env, _BS_CONTACT).float()
 
 
