@@ -230,8 +230,15 @@ def ball_stop_aim_curriculum(
   promote_rate: float = 0.6,
   eval_episodes: int = 20_000,
   ball_name: str = "ball",
+  start_stage: int = 0,
+  stage_params: dict[int, dict[str, dict]] | None = None,
 ) -> dict[str, torch.Tensor]:
   """Ball-stopping aim sigma by stages, promoted by performance.
+
+  ``stage_params``: {stage: {event name: {param: value}}}, extra event
+  params from that stage on (each stage applies all entries <= itself, in
+  order; e.g. far / lofted balls). ``start_stage``: stage at the first call
+  (resuming a run or play; the stage is not saved in checkpoints).
 
   An episode counts as good when it ended successfully (``env.bs_success``)
   and at that moment the ball is not behind the robot's START position
@@ -245,12 +252,21 @@ def ball_stop_aim_curriculum(
   ``aim_std`` param of ``event_name``. Stages only go up.
   """
   if not hasattr(env, "bs_aim_stage"):
-    env.bs_aim_stage = 0
+    env.bs_aim_stage = min(max(start_stage, 0), len(stages) - 1)
     env.bs_aim_eps = 0
     env.bs_aim_good = 0
     env.bs_aim_last_rate = 0.0
   params = env.event_manager.get_term_cfg(event_name).params
-  params["aim_std"] = stages[env.bs_aim_stage]
+
+  def _apply(stage: int) -> None:
+    params["aim_std"] = stages[stage]
+    for st in sorted((stage_params or {}).keys()):
+      if st > stage:
+        break
+      for ev, kv in stage_params[st].items():
+        env.event_manager.get_term_cfg(ev).params.update(kv)
+
+  _apply(env.bs_aim_stage)
 
   # First reset (before any episode) or nothing to count.
   if hasattr(env, "bs_success") and not isinstance(env_ids, slice) and env.common_step_counter > 0:
@@ -266,7 +282,7 @@ def ball_stop_aim_curriculum(
         env.bs_aim_last_rate = env.bs_aim_good / env.bs_aim_eps
         if env.bs_aim_last_rate >= promote_rate and env.bs_aim_stage < len(stages) - 1:
           env.bs_aim_stage += 1
-          params["aim_std"] = stages[env.bs_aim_stage]
+          _apply(env.bs_aim_stage)
         env.bs_aim_eps = 0
         env.bs_aim_good = 0
 

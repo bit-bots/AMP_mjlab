@@ -567,6 +567,8 @@ def _ball_stop_state(env: ManagerBasedRlEnv) -> None:
     env.bs_launch_dir[:, 0] = 1.0
     env.bs_start_xy = torch.zeros((n, 2), device=dev)
     env.bs_new_contact = torch.zeros(n, dtype=torch.bool, device=dev)
+    env.bs_far = torch.zeros(n, dtype=torch.bool, device=dev)
+    env.bs_loft = torch.zeros(n, dtype=torch.bool, device=dev)
     env.bs_success = torch.zeros(n, dtype=torch.bool, device=dev)
     env.bs_missed = torch.zeros(n, dtype=torch.bool, device=dev)
 
@@ -611,12 +613,18 @@ def reset_ball_stop(
     idle_time_range_s: tuple[float, float] = (1.0, 3.0),
     hold_time_range_s: tuple[float, float] = (1.0, 2.0),
     spawn_height_margin: float = 0.002,
+    far_prob: float = 0.0,
+    far_dist_range: tuple[float, float] = (4.0, 6.0),
 ) -> None:
     """Reset event: put the ball at rest ``spawn_dist_range`` meters from the
     robot, at a bearing within +/- ``spawn_bearing_deg`` of the robot's
     heading (0 = straight in front; set by a curriculum), and start the idle
     phase. Draws this episode's idle time before the launch and hold time
     after contact.
+
+    With probability ``far_prob`` (set by a curriculum) the ball spawns
+    ``far_dist_range`` meters away instead and is marked ``env.bs_far``;
+    ``ball_stop_cycle`` launches those faster.
 
     Must run after ``reset_from_motion`` (event dict order). Forces a
     ``sim.forward()`` to read the robot pose just written there (see
@@ -637,6 +645,12 @@ def reset_ball_stop(
     robot_xy = robot.data.root_link_pos_w[env_ids, :2]
     robot_yaw = robot.data.heading_w[env_ids]
     dist = sample_uniform(spawn_dist_range[0], spawn_dist_range[1], (n,), device=dev)
+    far = torch.rand(n, device=dev) < far_prob
+    if far.any():
+        far_dist = sample_uniform(far_dist_range[0], far_dist_range[1], (n,), device=dev)
+        dist = torch.where(far, far_dist, dist)
+    env.bs_far[env_ids] = far
+    env.bs_loft[env_ids] = False
     half = math.radians(spawn_bearing_deg)
     bearing = robot_yaw + sample_uniform(-half, half, (n,), device=dev)
     to_spawn = torch.stack([torch.cos(bearing), torch.sin(bearing)], dim=-1)
@@ -679,6 +693,10 @@ def ball_stop_cycle(
     aim_std: float = 0.075,
     aim_clip: float | None = None,
     arrival_speed_range: tuple[float, float] = (0.5, 2.0),
+    far_arrival_speed_range: tuple[float, float] = (1.5, 3.0),
+    loft_prob: float = 0.0,
+    loft_angle_deg_range: tuple[float, float] = (10.0, 25.0),
+    loft_speed_scale_range: tuple[float, float] = (1.2, 1.5),
     max_launch_speed: float = 8.0,
     miss_pass_dist: float = 0.5,
     miss_stop_speed: float = 0.05,
@@ -691,7 +709,13 @@ def ball_stop_cycle(
       where it lies toward the robot base, with a lateral aim offset
       ~ N(0, ``aim_std``), clipped to +/- ``aim_clip`` meters unless None (perpendicular to
       the path), so that it arrives with ``arrival_speed_range`` m/s
-      (approximate, see ``_ball_launch_speed``).
+      (approximate, see ``_ball_launch_speed``). Far balls (``env.bs_far``,
+      see ``reset_ball_stop``) use ``far_arrival_speed_range`` instead.
+    - Lofted balls: with probability ``loft_prob`` (set by a curriculum) a
+      non-far ball is launched with its horizontal speed scaled by
+      ``loft_speed_scale_range`` and an upward angle in
+      ``loft_angle_deg_range`` (vz = v_xy * tan(angle)); it bounces before
+      it rolls.
     - Incoming -> contact on the first robot-ball contact
       (``contact_sensor_name``, any substep of the step). Sets the one-step
       flag ``env.bs_new_contact``.
@@ -752,10 +776,27 @@ def ball_stop_cycle(
     path_len = torch.norm(path, dim=-1).clamp(min=1e-6)
     direction = path / path_len.unsqueeze(-1)
     v_arr = sample_uniform(arrival_speed_range[0], arrival_speed_range[1], (n,), device=dev)
+    far = env.bs_far[ids]
+    if far.any():
+        v_far = sample_uniform(
+            far_arrival_speed_range[0], far_arrival_speed_range[1], (n,), device=dev
+        )
+        v_arr = torch.where(far, v_far, v_arr)
     speed, radius = _ball_launch_speed(env, ids, ball, path_len, v_arr, max_launch_speed)
-    ball.write_root_link_velocity_to_sim(
-        _rolling_ball_velocity(direction, speed, radius), env_ids=ids
-    )
+    loft = (torch.rand(n, device=dev) < loft_prob) & ~far
+    env.bs_loft[ids] = loft
+    if loft.any():
+        scale = sample_uniform(
+            loft_speed_scale_range[0], loft_speed_scale_range[1], (n,), device=dev
+        )
+        speed = torch.where(loft, (speed * scale).clamp(max=max_launch_speed), speed)
+    vel = _rolling_ball_velocity(direction, speed, radius)
+    if loft.any():
+        angle = torch.deg2rad(
+            sample_uniform(loft_angle_deg_range[0], loft_angle_deg_range[1], (n,), device=dev)
+        )
+        vel[:, 2] = torch.where(loft, speed * torch.tan(angle), vel[:, 2])
+    ball.write_root_link_velocity_to_sim(vel, env_ids=ids)
     env.bs_phase[ids] = BS_INCOMING
     env.bs_phase_steps[ids] = 0
     env.bs_launch_origin[ids] = ball_xy[ids]

@@ -84,10 +84,29 @@ BALL_AIM_CLIP = None
 # distance and speed do not matter). The
 # threshold 0.65. Checked every
 # BALL_AIM_EVAL_EPISODES ended episodes (~45 iterations at 4096 envs).
-BALL_AIM_STD_STAGES = [0.25, 0.375, 0.5]
+# Stage 3 keeps sigma 0.5 and adds harder balls (BALL_STAGE_PARAMS).
+BALL_AIM_STD_STAGES = [0.25, 0.375, 0.5, 0.5]
 BALL_AIM_PROMOTE_RATE = 0.65
 BALL_AIM_EVAL_EPISODES = 20_000
 BALL_AIM_STD = BALL_AIM_STD_STAGES[0]
+# Stage 3, sampled per ball (the other balls stay as in stage 2):
+# - BALL_FAR_PROB of the balls spawn BALL_FAR_DIST_RANGE m away and arrive
+#   with BALL_FAR_ARRIVAL_SPEED_RANGE m/s (faster than normal).
+# - BALL_LOFT_PROB of the other balls are launched upward at
+#   BALL_LOFT_ANGLE_DEG_RANGE deg with BALL_LOFT_SPEED_SCALE_RANGE times the
+#   normal launch speed; they bounce before they roll.
+BALL_FAR_PROB = 0.2
+BALL_FAR_DIST_RANGE = (4.0, 6.0)
+BALL_FAR_ARRIVAL_SPEED_RANGE = (1.5, 3.0)
+BALL_LOFT_PROB = 0.15
+BALL_LOFT_ANGLE_DEG_RANGE = (10.0, 25.0)
+BALL_LOFT_SPEED_SCALE_RANGE = (1.2, 1.5)
+BALL_STAGE_PARAMS = {
+  3: {
+    "reset_ball": {"far_prob": BALL_FAR_PROB},
+    "ball_stop_cycle": {"loft_prob": BALL_LOFT_PROB},
+  },
+}
 # Ball friction: kick-env ranges (log-uniform), but a share of the balls
 # (BALL_LOW_FRICTION_PROB) gets a range BALL_LOW_FRICTION_FACTOR times lower
 # instead (log-uniform in [lo / factor, lo]): slides more on the foot and
@@ -312,14 +331,20 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     weight=-10.0,
     params={"tolerance": 0.25},
   )
-  # Ball incoming: step SIDEWAYS (across the ball's path) toward where the
-  # path crosses the robot's start line; moving along the path earns nothing.
-  # Normalized to [0, 1] (1 at max_speed, or on the path within
-  # start_line_tol of the start line).
+  # Ball incoming: move toward the closest point on the ball's path (original
+  # intercept, lateral_only=False). Normalized to [0, 1] (1 at max_speed, or
+  # within on_line_tol of the path). lateral_only=True: only sideways steps
+  # toward where the path crosses the start line count.
   cfg.rewards["bs_intercept"] = RewardTermCfg(
     func=amp_mdp.ball_stop_intercept,
     weight=2.0,
-    params={"max_speed": 0.5, "on_line_tol": 0.05, "start_line_tol": 0.15},
+    params={
+      "max_speed": 0.5,
+      "on_line_tol": 0.05,
+      "start_line_tol": 0.15,
+      # False: original intercept (toward the closest point on the path).
+      "lateral_only": False,
+    },
   )
   # First robot-ball contact: one-shot, 250 * 0.02 = 5.
   cfg.rewards["bs_contact"] = RewardTermCfg(
@@ -369,6 +394,8 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "spawn_bearing_deg": BALL_BEARING_STAGES[0][1],
       "idle_time_range_s": BALL_IDLE_TIME_RANGE_S,
       "hold_time_range_s": BALL_HOLD_TIME_RANGE_S,
+      "far_prob": 0.0,  # set by the ball_aim_std curriculum (stage 3)
+      "far_dist_range": BALL_FAR_DIST_RANGE,
     },
   )
   cfg.events["ball_stop_cycle"] = EventTermCfg(
@@ -381,6 +408,13 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "aim_std": BALL_AIM_STD,
       "aim_clip": BALL_AIM_CLIP,
       "arrival_speed_range": BALL_ARRIVAL_SPEED_RANGE,
+      "far_arrival_speed_range": BALL_FAR_ARRIVAL_SPEED_RANGE,
+      "loft_prob": 0.0,  # set by the ball_aim_std curriculum (stage 3)
+      "loft_angle_deg_range": BALL_LOFT_ANGLE_DEG_RANGE,
+      "loft_speed_scale_range": BALL_LOFT_SPEED_SCALE_RANGE,
+      # Ball farther than this from the robot while incoming = miss; above
+      # the far spawn distance.
+      "miss_max_dist": 8.0,
     },
   )
 
@@ -403,6 +437,8 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "promote_rate": BALL_AIM_PROMOTE_RATE,
       "eval_episodes": BALL_AIM_EVAL_EPISODES,
       "ball_name": BALL_NAME,
+      "start_stage": 0,
+      "stage_params": BALL_STAGE_PARAMS,
     },
   )
 
@@ -420,10 +456,9 @@ def piplus_amp_ball_stop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   if play:
     # PLAY_AIM_STAGE=<n> starts the aim sigma curriculum at stage n (the
     # stage is not saved in the checkpoint, so play always starts at 0).
-    _stage = int(os.environ.get("PLAY_AIM_STAGE", "0"))
-    _stages = BALL_AIM_STD_STAGES[min(_stage, len(BALL_AIM_STD_STAGES) - 1):]
-    cfg.curriculum["ball_aim_std"].params["stages"] = _stages
-    cfg.events["ball_stop_cycle"].params["aim_std"] = _stages[0]
+    _stage = min(int(os.environ.get("PLAY_AIM_STAGE", "0")), len(BALL_AIM_STD_STAGES) - 1)
+    cfg.curriculum["ball_aim_std"].params["start_stage"] = _stage
+    cfg.events["ball_stop_cycle"].params["aim_std"] = BALL_AIM_STD_STAGES[_stage]
     # Ghost ball at the position the actor observes (noise + delay).
     cfg.scene.entities["ball_ghost"] = get_ball_ghost_cfg()
     cfg.events["ball_obs_ghost"] = EventTermCfg(

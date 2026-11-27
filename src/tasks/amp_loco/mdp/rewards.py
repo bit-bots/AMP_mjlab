@@ -1209,9 +1209,15 @@ def ball_stop_intercept(
   max_speed: float = 0.5,
   on_line_tol: float = 0.05,
   start_line_tol: float = 0.15,
+  lateral_only: bool = True,
   robot_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
   """Incoming phase: reward for stepping SIDEWAYS into the ball's path.
+
+  ``lateral_only=False`` restores the original version: reward for moving
+  toward the closest point on the ball's path (any direction, so also
+  toward the ball), and 1 within ``on_line_tol`` of the path anywhere along
+  it. ``start_line_tol`` is then ignored.
 
   Target: where the ball's path (the straight launch line,
   env.bs_launch_origin + t * env.bs_launch_dir) crosses the lateral line
@@ -1230,6 +1236,15 @@ def ball_stop_intercept(
     return torch.zeros(env.num_envs, device=env.device)
   p = robot.data.root_link_pos_w[:, :2]
   o, d = env.bs_launch_origin, env.bs_launch_dir
+  if not lateral_only:
+    closest = o + d * ((p - o) * d).sum(-1, keepdim=True)
+    to_line = closest - p
+    dist = torch.norm(to_line, dim=-1)
+    u = to_line / dist.clamp(min=1e-6).unsqueeze(-1)
+    v_toward = (robot.data.root_link_lin_vel_w[:, :2] * u).sum(-1)
+    r = torch.clamp(v_toward, 0.0, max_speed) / max_speed
+    r = torch.where(dist < on_line_tol, torch.ones_like(r), r)
+    return r * incoming.float()
   n = torch.stack([-d[:, 1], d[:, 0]], dim=-1)  # lateral unit vector
   target = o + d * ((env.bs_start_xy - o) * d).sum(-1, keepdim=True)
   lat_err = ((target - p) * n).sum(-1)  # signed lateral distance to the path
