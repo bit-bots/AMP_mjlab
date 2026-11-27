@@ -99,10 +99,11 @@ BALL_LOW_FRICTION_FACTOR = 3.0
 BALL_OBS_STD_BASE = 0.0175  # = kick env std
 BALL_OBS_STD_PER_M = 0.02
 
-# AMP reference clips for RSI (reset_from_motion). Must match the runner's
-# amp_motion_files (rl_cfg.py, BALL_STOP_AMP_MOTION_SUBDIR) as a rule; the
-# flat walk env already defaults to WalkandRun.
-BALL_STOP_MOTION_SUBDIR = "WalkandRun"
+# Reference clips for RSI (reset_from_motion), subfolder of
+# src/assets/motions/piplus/amp/. Keep it the same as the AMP discriminator's
+# clips (rl_cfg.py, BALL_STOP_AMP_MOTION_SUBDIR), so episodes start from poses
+# the discriminator knows.
+BALL_STOP_MOTION_SUBDIR = "BallStop"
 
 
 def _low_tail_log_uniform_sample(lower, upper, shape, device):

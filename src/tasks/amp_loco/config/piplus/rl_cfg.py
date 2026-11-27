@@ -126,9 +126,9 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
 
 
 # AMP reference clips for the ball-stopping task (subfolder of
-# src/assets/motions/piplus/amp/). There are no ball-stopping clips yet, so
-# the discriminator trains on the walk/run clips.
-BALL_STOP_AMP_MOTION_SUBDIR = "WalkandRun"
+# src/assets/motions/piplus/amp/): BallStop/ = run clip + selected flo
+# video-capture clips (each with a mirrored copy).
+BALL_STOP_AMP_MOTION_SUBDIR = "BallStop"
 
 
 def piplus_amp_ball_stop_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
