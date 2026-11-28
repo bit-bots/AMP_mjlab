@@ -122,7 +122,7 @@ BALL_OBS_STD_PER_M = 0.02
 # src/assets/motions/piplus/amp/. Keep it the same as the AMP discriminator's
 # clips (rl_cfg.py, BALL_STOP_AMP_MOTION_SUBDIR), so episodes start from poses
 # the discriminator knows.
-BALL_STOP_MOTION_SUBDIR = "BallStop"
+BALL_STOP_MOTION_SUBDIR = "BallStop2"
 
 
 def _low_tail_log_uniform_sample(lower, upper, shape, device):

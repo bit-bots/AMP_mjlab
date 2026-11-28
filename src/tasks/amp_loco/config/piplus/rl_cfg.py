@@ -126,9 +126,10 @@ def piplus_amp_kick_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
 
 
 # AMP reference clips for the ball-stopping task (subfolder of
-# src/assets/motions/piplus/amp/): BallStop/ = run clip + selected flo
-# video-capture clips (each with a mirrored copy).
-BALL_STOP_AMP_MOTION_SUBDIR = "BallStop"
+# src/assets/motions/piplus/amp/): BallStop2/ = flo 171958 + the goalie
+# clips (grounded; goalie_v1_seg08 with the retargeting spin removed), each
+# with a mirrored copy. BallStop/ = previous set (run clip + flo clips).
+BALL_STOP_AMP_MOTION_SUBDIR = "BallStop2"
 
 
 def piplus_amp_ball_stop_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
